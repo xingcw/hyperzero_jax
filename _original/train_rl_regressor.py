@@ -11,7 +11,6 @@ import os
 import platform
 import logging
 import math
-import pickle
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
@@ -21,7 +20,7 @@ from pathlib import Path
 
 import hydra
 import omegaconf
-import jax
+import torch
 from hydra.core.hydra_config import HydraConfig
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,8 +28,10 @@ import utils.utils as utils
 from utils.dataset import RLSolutionDataset, RLSolutionMetaDataset
 from utils.dataloader import FastTensorDataLoader, FastTensorMetaDataLoader
 
+torch.backends.cudnn.benchmark = True
+
 # If using multirun, set the GPUs here:
-AVAILABLE_GPUS = [0, 1, 2, 3, 4]
+AVAILABLE_GPUS = [1, 2, 3, 4, 0]
 
 
 def make_approximator(input_dim, state_dim, action_dim, cfg, device=None):
@@ -47,7 +48,8 @@ class Workspace:
         self.work_dir = Path.cwd()
 
         self.cfg = cfg
-        self.rng_key = utils.set_seed_everywhere(cfg.seed)
+        utils.set_seed_everywhere(cfg.seed)
+        self.device = torch.device(cfg.device)
 
         # hacked up way to see if we are using MAML or not
         self.is_meta_learning = True if 'meta' in self.cfg.approximator_name else False
@@ -96,6 +98,7 @@ class Workspace:
             self.cfg.domain_task,
             self.cfg.input_to_model,
             self.cfg.seed,
+            self.device,
         )
 
         if self.is_meta_learning:
@@ -103,9 +106,9 @@ class Workspace:
         else:
             batch_size = self.cfg.batch_size
 
-        self.train_loader = dataloader_fn(*self.dataset.train_dataset,
+        self.train_loader = dataloader_fn(*self.dataset.train_dataset[:], device=self.device,
                                           batch_size=batch_size, shuffle=True)
-        self.test_loader = dataloader_fn(*self.dataset.test_dataset,
+        self.test_loader = dataloader_fn(*self.dataset.test_dataset[:], device=self.device,
                                          batch_size=batch_size, shuffle=True)
 
     @property
@@ -163,16 +166,16 @@ class Workspace:
             self._global_epoch += 1
 
     def save_snapshot(self):
-        snapshot = self.work_dir / 'snapshot.pkl'
-        keys_to_save = ['timer', '_global_epoch', '_global_episode']
+        snapshot = self.work_dir / 'snapshot.pt'
+        keys_to_save = ['agent', 'timer', '_global_step', '_global_episode']
         payload = {k: self.__dict__[k] for k in keys_to_save}
         with snapshot.open('wb') as f:
-            pickle.dump(payload, f)
+            torch.save(payload, f)
 
     def load_snapshot(self):
-        snapshot = self.work_dir / 'snapshot.pkl'
+        snapshot = self.work_dir / 'snapshot.pt'
         with snapshot.open('rb') as f:
-            payload = pickle.load(f)
+            payload = torch.load(f)
         for k, v in payload.items():
             self.__dict__[k] = v
 
@@ -182,14 +185,14 @@ def main(cfg):
     log = logging.getLogger(__name__)
     try:
         device_id = AVAILABLE_GPUS[HydraConfig.get().job.num % len(AVAILABLE_GPUS)]
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
-        log.info(f"Total number of GPUs is {AVAILABLE_GPUS}, running on GPU {device_id}.")
+        cfg.device = f"{cfg.device}:{device_id}"
+        log.info(f"Total number of GPUs is {AVAILABLE_GPUS}, running on {cfg.device}.")
     except omegaconf.errors.MissingMandatoryValue:
         pass
 
     root_dir = Path.cwd()
     workspace = Workspace(cfg)
-    snapshot = root_dir / 'snapshot.pkl'
+    snapshot = root_dir / 'snapshot.pt'
     if snapshot.exists():
         print(f'resuming: {snapshot}')
         workspace.load_snapshot()

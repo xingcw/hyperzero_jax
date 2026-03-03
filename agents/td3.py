@@ -3,13 +3,15 @@ Implementation of Twin Delayed Deep Deterministic Policy Gradients (TD3)
 https://arxiv.org/abs/1802.09477
 """
 
-import hydra
-import copy
+import pickle
 import numpy as np
 from pathlib import Path
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax.training.train_state import TrainState
 
 from models.core import DeterministicActor, Critic
 import utils.utils as utils
@@ -20,7 +22,6 @@ class TD3Agent:
                  critic_target_tau, num_expl_steps, update_every_steps,
                  stddev_schedule, stddev_clip):
 
-        self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
         self.num_expl_steps = num_expl_steps
@@ -30,119 +31,172 @@ class TD3Agent:
         self.hidden_dim = hidden_dim
         self.lr = lr
 
-        # models
-        self.actor = DeterministicActor(obs_shape[0], action_shape[0], hidden_dim).to(self.device)
-        self.actor_target = copy.deepcopy(self.actor)
+        # Initialize PRNG
+        rng_key = jax.random.PRNGKey(0)
+        rng_key, actor_key, critic_key = jax.random.split(rng_key, 3)
+        self.rng_key = rng_key
 
-        self.critic = Critic(obs_shape[0], action_shape[0], hidden_dim).to(self.device)
-        self.critic_target = copy.deepcopy(self.critic)
+        # Dummy inputs for init
+        dummy_obs = jnp.ones((1,) + obs_shape)
+        dummy_action = jnp.ones((1,) + action_shape)
 
-        # optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        # Actor
+        self.actor_module = DeterministicActor(action_dim=action_shape[0],
+                                               hidden_dim=hidden_dim)
+        actor_params = self.actor_module.init(actor_key, dummy_obs)['params']
+        self.actor_state = TrainState.create(
+            apply_fn=self.actor_module.apply,
+            params=actor_params,
+            tx=optax.adam(lr),
+        )
+        self.actor_target_params = jax.tree.map(jnp.copy, actor_params)
 
-        self.train()
-        self.actor_target.train()
-        self.critic_target.train()
-
-    def train(self, training=True):
-        self.training = training
-        self.actor.train(training)
-        self.critic.train(training)
+        # Critic
+        self.critic_module = Critic(hidden_dim=hidden_dim)
+        critic_params = self.critic_module.init(critic_key, dummy_obs, dummy_action)['params']
+        self.critic_state = TrainState.create(
+            apply_fn=self.critic_module.apply,
+            params=critic_params,
+            tx=optax.adam(lr),
+        )
+        self.critic_target_params = jax.tree.map(jnp.copy, critic_params)
 
     def act(self, obs, step, eval_mode):
-        obs = torch.as_tensor(obs, device=self.device)
-        stddev = utils.schedule(self.stddev_schedule, step)
-        action = self.actor(obs.float().unsqueeze(0))
+        obs = jnp.asarray(obs, dtype=jnp.float32)
+        action = self.actor_module.apply(
+            {'params': self.actor_state.params}, obs[None]
+        )
+        action = np.asarray(action[0])
+
         if eval_mode:
-            action = action.cpu().numpy()[0]
+            pass  # deterministic
         else:
-            action = action.cpu().numpy()[0] + np.random.normal(0, stddev, size=self.action_dim)
+            stddev = utils.schedule(self.stddev_schedule, step)
+            action = action + np.random.normal(0, stddev, size=self.action_dim)
             if step < self.num_expl_steps:
                 action = np.random.uniform(-1.0, 1.0, size=self.action_dim)
         return action.astype(np.float32)
 
     def observe(self, obs, action):
-        obs = torch.as_tensor(obs, device=self.device).float().unsqueeze(0)
-        action = torch.as_tensor(action, device=self.device).float().unsqueeze(0)
+        obs = jnp.asarray(obs, dtype=jnp.float32)[None]
+        action = jnp.asarray(action, dtype=jnp.float32)[None]
 
-        q, _ = self.critic(obs, action)
+        q, _ = self.critic_module.apply(
+            {'params': self.critic_state.params}, obs, action
+        )
 
         return {
-            'state': obs.cpu().numpy()[0],
-            'value': q.cpu().numpy()[0]
+            'state': np.asarray(obs[0]),
+            'value': np.asarray(q[0])
         }
 
+    @staticmethod
+    @partial(jax.jit, static_argnames=('actor_apply_fn', 'critic_apply_fn'))
+    def _update_critic(critic_state, critic_target_params,
+                       actor_target_params, actor_apply_fn, critic_apply_fn,
+                       obs, action, reward, discount, next_obs,
+                       stddev, stddev_clip, rng_key):
+        # Compute target Q
+        next_action = actor_apply_fn({'params': actor_target_params}, next_obs)
+        noise = jnp.clip(
+            jax.random.normal(rng_key, action.shape) * stddev,
+            -stddev_clip, stddev_clip
+        )
+        next_action = jnp.clip(next_action + noise, -1.0, 1.0)
+
+        target_Q1, target_Q2 = critic_apply_fn(
+            {'params': critic_target_params}, next_obs, next_action
+        )
+        target_Q = jnp.minimum(target_Q1, target_Q2)
+        target_Q = reward + discount * target_Q
+
+        def critic_loss_fn(critic_params):
+            current_Q1, current_Q2 = critic_apply_fn(
+                {'params': critic_params}, obs, action
+            )
+            loss = jnp.mean((current_Q1 - target_Q)**2) + jnp.mean((current_Q2 - target_Q)**2)
+            return loss, (current_Q1, current_Q2, target_Q)
+
+        (critic_loss, (q1, q2, tq)), grads = jax.value_and_grad(
+            critic_loss_fn, has_aux=True
+        )(critic_state.params)
+
+        critic_state = critic_state.apply_gradients(grads=grads)
+
+        metrics = {
+            'critic_loss': critic_loss,
+            'critic_q1': jnp.mean(q1),
+            'critic_q2': jnp.mean(q2),
+            'critic_target_q': jnp.mean(tq),
+        }
+
+        return critic_state, metrics
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=('actor_apply_fn', 'critic_apply_fn'))
+    def _update_actor(actor_state, critic_params, actor_apply_fn, critic_apply_fn, obs):
+        def actor_loss_fn(actor_params):
+            action = actor_apply_fn({'params': actor_params}, obs)
+            q1 = critic_apply_fn(
+                {'params': critic_params}, obs, action,
+                method=Critic.Q1
+            )
+            return -jnp.mean(q1)
+
+        actor_loss, grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+        actor_state = actor_state.apply_gradients(grads=grads)
+
+        return actor_state, {'actor_loss': actor_loss}
+
     def update_critic(self, obs, action, reward, discount, next_obs, step):
-        metrics = dict()
+        stddev = utils.schedule(self.stddev_schedule, step)
+        self.rng_key, subkey = jax.random.split(self.rng_key)
 
-        with torch.no_grad():
-            # Select action according to policy and add clipped noise
-            stddev = utils.schedule(self.stddev_schedule, step)
-            noise = (torch.randn_like(action) * stddev).clamp(-self.stddev_clip, self.stddev_clip)
+        self.critic_state, metrics = self._update_critic(
+            self.critic_state, self.critic_target_params,
+            self.actor_target_params,
+            self.actor_module.apply, self.critic_module.apply,
+            obs, action, reward, discount, next_obs,
+            stddev, self.stddev_clip, subkey
+        )
 
-            next_action = (self.actor_target(next_obs) + noise).clamp(-1.0, 1.0)
-
-            # Compute the target Q value
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = reward + discount * target_Q
-
-        # Get current Q estimates
-        current_Q1, current_Q2 = self.critic(obs, action)
-
-        # Compute critic loss
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
-
-        metrics['critic_target_q'] = target_Q.mean().item()
-        metrics['critic_q1'] = current_Q1.mean().item()
-        metrics['critic_q2'] = current_Q2.mean().item()
-        metrics['critic_loss'] = critic_loss.item()
-
-        # Optimize the critic
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        self.critic_optimizer.step()
-
-        return metrics
+        return {k: float(v) for k, v in metrics.items()}
 
     def update_actor(self, obs, step):
-        metrics = dict()
+        self.actor_state, metrics = self._update_actor(
+            self.actor_state, self.critic_state.params,
+            self.actor_module.apply, self.critic_module.apply, obs
+        )
 
-        # Compute actor loss
-        actor_loss = -self.critic.Q1(obs, self.actor(obs)).mean()
-
-        # Optimize the actor
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        metrics['actor_loss'] = actor_loss.item()
-
-        return metrics
+        return {k: float(v) for k, v in metrics.items()}
 
     def update(self, replay_iter, step):
         metrics = dict()
 
         batch = next(replay_iter)
-        obs, action, reward, discount, next_obs, _ = utils.to_torch(
-            batch, self.device)
+        obs, action, reward, discount, next_obs, _ = utils.to_jax(batch)
 
-        obs = obs.float()
-        next_obs = next_obs.float()
+        obs = obs.astype(jnp.float32)
+        next_obs = next_obs.astype(jnp.float32)
 
-        metrics['batch_reward'] = reward.mean().item()
+        metrics['batch_reward'] = float(jnp.mean(reward))
 
         # update critic
         metrics.update(self.update_critic(obs, action, reward, discount, next_obs, step))
 
         # update actor (delayed)
         if step % self.update_every_steps == 0:
-            metrics.update(self.update_actor(obs.detach(), step))
+            metrics.update(self.update_actor(obs, step))
 
             # update target networks
-            utils.soft_update_params(self.critic, self.critic_target, self.critic_target_tau)
-            utils.soft_update_params(self.actor, self.actor_target, self.critic_target_tau)
+            self.critic_target_params = utils.soft_update_params(
+                self.critic_state.params, self.critic_target_params,
+                self.critic_target_tau
+            )
+            self.actor_target_params = utils.soft_update_params(
+                self.actor_state.params, self.actor_target_params,
+                self.critic_target_tau
+            )
 
         return metrics
 
@@ -150,16 +204,31 @@ class TD3Agent:
         model_save_dir = Path(f'{model_dir}/step_{str(step).zfill(8)}')
         model_save_dir.mkdir(exist_ok=True, parents=True)
 
-        torch.save(self.actor.state_dict(), f'{model_save_dir}/actor.pt')
-        torch.save(self.critic.state_dict(), f'{model_save_dir}/critic.pt')
+        with open(f'{model_save_dir}/actor.pkl', 'wb') as f:
+            pickle.dump({
+                'params': jax.device_get(self.actor_state.params),
+                'target_params': jax.device_get(self.actor_target_params),
+            }, f)
+        with open(f'{model_save_dir}/critic.pkl', 'wb') as f:
+            pickle.dump({
+                'params': jax.device_get(self.critic_state.params),
+                'target_params': jax.device_get(self.critic_target_params),
+            }, f)
 
     def load(self, model_dir, step):
         print(f"Loading the model from {model_dir}, step: {step}")
         model_load_dir = Path(f'{model_dir}/step_{str(step).zfill(8)}')
 
-        self.actor.load_state_dict(
-            torch.load(f'{model_load_dir}/actor.pt', map_location=self.device)
-        )
-        self.critic.load_state_dict(
-            torch.load(f'{model_load_dir}/critic.pt', map_location=self.device)
-        )
+        with open(f'{model_load_dir}/actor.pkl', 'rb') as f:
+            actor_data = pickle.load(f)
+            self.actor_state = self.actor_state.replace(
+                params=jax.device_put(actor_data['params'])
+            )
+            self.actor_target_params = jax.device_put(actor_data['target_params'])
+
+        with open(f'{model_load_dir}/critic.pkl', 'rb') as f:
+            critic_data = pickle.load(f)
+            self.critic_state = self.critic_state.replace(
+                params=jax.device_put(critic_data['params'])
+            )
+            self.critic_target_params = jax.device_put(critic_data['target_params'])

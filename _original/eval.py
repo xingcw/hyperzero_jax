@@ -12,13 +12,12 @@ if platform.system() == 'Linux':
 import argparse
 from pathlib import Path
 
+import hydra
 import numpy as np
+import torch
 import omegaconf
 from omegaconf import OmegaConf
 from collections import defaultdict
-
-import jax
-import jax.numpy as jnp
 
 import utils.dmc as dmc
 import utils.utils as utils
@@ -26,6 +25,10 @@ import utils.plots as plots
 from train import make_agent
 from train_rl_regressor import make_approximator
 from utils.video import VideoRecorder
+
+torch.backends.cudnn.benchmark = True
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu'
 
 
 class Workspace:
@@ -35,7 +38,8 @@ class Workspace:
 
         self.cfg = cfg
         self.args = args
-        self.rng_key = utils.set_seed_everywhere(cfg.seed)
+        utils.set_seed_everywhere(cfg.seed)
+        self.device = torch.device(device)
 
         # Video dir
         self.video_dir = Path(args.video_dir).joinpath(f'{self.work_dir.parents[1].name}')
@@ -46,7 +50,8 @@ class Workspace:
         # create and load the RL agent
         self.agent = make_agent(self.eval_env_rl_agent.observation_spec(),
                                 self.eval_env_rl_agent.action_spec(),
-                                self.cfg.agent)
+                                self.cfg.agent,
+                                device=device)
         self.step_to_load = args.step_to_load if args.step_to_load != 0 else utils.get_last_model(self.agent_model_dir)
         self.agent.load(self.agent_model_dir, self.step_to_load)
 
@@ -89,8 +94,10 @@ class Workspace:
             self.rl_regressor = make_approximator(input_dim,
                                                   self.eval_env_rl_agent.observation_spec().shape[0],
                                                   self.eval_env_rl_agent.action_spec().shape[0],
-                                                  rl_regressor_cfg.approximator)
+                                                  rl_regressor_cfg.approximator,
+                                                  device=device)
             regressor_step_to_load = utils.get_last_model(rl_regressor_model_dir)
+            # regressor_step_to_load = 'best_total'
             self.rl_regressor.load(rl_regressor_model_dir, regressor_step_to_load)
             if not hasattr(self.rl_regressor, 'act'):
                 print("RL regressor does not have the policy.")
@@ -152,7 +159,7 @@ class Workspace:
             self.video_recorder.init(env, enabled=(episode == 0 and self.args.eval_mode == 'comparison_data'))
 
             while not time_step.last():
-                with utils.eval_mode(self.agent):
+                with torch.no_grad(), utils.eval_mode(self.agent):
                     reward_param = self._get_reward_param()
                     dynamics_param = self._get_dynamics_param()
                     reward_dynamics_param = self._get_reward_dynamics_param()
@@ -290,6 +297,9 @@ def main():
         agent_rollout_fname = f"{workspace.base_name}_rollout_{workspace.base_name}_rollout_agent"
         if not Path(f"{workspace.rollout_comparison_data}/{agent_rollout_fname}.npy").is_file() or workspace.is_meta_learning:
             rl_rollout_data = workspace.rollout(n_episodes=args.n_episodes, use_approximator=False)
+            # workspace.save_rollout(rl_rollout_data,
+            #                        dir=workspace.rollout_comparison_data,
+            #                        name=agent_rollout_fname)
         else:
             print("Skipping rolling out the RL agent, because the data is already generated.")
 
@@ -326,6 +336,9 @@ def main():
                 goal_coord=None,
                 plot_type='scatter', label=label
             )
+
+        # visualization of the predicted rollout, values/rewards in the actual MDP
+        # TODO
 
 
 if __name__ == '__main__':

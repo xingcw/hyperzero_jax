@@ -5,6 +5,8 @@ import traceback
 from collections import defaultdict
 
 import numpy as np
+import torch
+from torch.utils.data import IterableDataset
 
 
 def episode_len(episode):
@@ -71,8 +73,7 @@ class ReplayBufferStorage:
         save_episode(episode, self._replay_dir / eps_fn)
 
 
-class ReplayBuffer:
-    """Replay buffer as a plain Python iterable (no torch dependency)."""
+class ReplayBuffer(IterableDataset):
     def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
                  fetch_every, save_snapshot):
         self._replay_dir = replay_dir
@@ -115,7 +116,10 @@ class ReplayBuffer:
         if self._samples_since_last_fetch < self._fetch_every:
             return
         self._samples_since_last_fetch = 0
-        worker_id = 0
+        try:
+            worker_id = torch.utils.data.get_worker_info().id
+        except:
+            worker_id = 0
         eps_fns = sorted(self._replay_dir.glob('*.npz'), reverse=True)
         fetched_size = 0
         for eps_fn in eps_fns:
@@ -177,24 +181,9 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             fetch_every=1000,
                             save_snapshot=save_snapshot)
 
-    return BatchedIterator(iterable, batch_size)
-
-
-class BatchedIterator:
-    """Simple batched iterator that replaces torch DataLoader."""
-    def __init__(self, iterable, batch_size):
-        self._iterable = iterable
-        self._batch_size = batch_size
-        self._iter = None
-
-    def __iter__(self):
-        self._iter = iter(self._iterable)
-        return self
-
-    def __next__(self):
-        samples = []
-        for _ in range(self._batch_size):
-            samples.append(next(self._iter))
-        # Stack into batched numpy arrays
-        batch = tuple(np.stack([s[i] for s in samples]) for i in range(len(samples[0])))
-        return batch
+    loader = torch.utils.data.DataLoader(iterable,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         pin_memory=True,
+                                         worker_init_fn=_worker_init_fn)
+    return loader

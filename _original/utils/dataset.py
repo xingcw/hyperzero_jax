@@ -5,6 +5,9 @@ from pathlib import Path
 from collections import defaultdict
 from numpy.random import default_rng
 
+import torch
+from torch.utils.data import TensorDataset
+
 
 def _get_reward_param(data_dir, domain_task, seed, test_fraction):
     """
@@ -73,11 +76,12 @@ class RLSolutionDataset:
     Dataset of near-optimal trajectories on a family of MDPs.
     Used for training HyperZero and MLP baselines.
     """
-    def __init__(self, data_dir, domain_task, input_to_model, seed, device=None):
+    def __init__(self, data_dir, domain_task, input_to_model, seed, device):
         assert input_to_model in ['rew', 'dyn', 'rew_dyn']
         self.data_dir = data_dir
         self.domain_task = domain_task
         self.input_to_model = input_to_model
+        self.device = device
         self.test_fraction = 0.15
         self.seed = seed
 
@@ -95,7 +99,7 @@ class RLSolutionDataset:
         self.setup()
 
     def setup(self):
-        train_arrays, test_arrays = [], []
+        train_tensors, test_tensors = [], []
 
         # load the dataset
         self.train_data_np, self.test_data_np = self._load_dataset(flatten=True)
@@ -109,15 +113,15 @@ class RLSolutionDataset:
                                                                     axis=-1)
 
         for k in self.data_keys:
-            train_arrays.append(
-                np.array(self.train_data_np[k], dtype=np.float32)
+            train_tensors.append(
+                torch.tensor(self.train_data_np[k], dtype=torch.float, device=self.device)
             )
-            test_arrays.append(
-                np.array(self.test_data_np[k], dtype=np.float32)
+            test_tensors.append(
+                torch.tensor(self.test_data_np[k], dtype=torch.float, device=self.device)
             )
 
-        self.train_dataset = train_arrays
-        self.test_dataset = test_arrays
+        self.train_dataset = TensorDataset(*train_tensors)
+        self.test_dataset = TensorDataset(*test_tensors)
 
     def _load_dataset(self, flatten=False):
         train_data, test_data = self._generate_data(flatten)
@@ -183,7 +187,7 @@ class RLSolutionMetaDataset(RLSolutionDataset):
     Dataset of near-optimal trajectories on a family of MDPs.
     Used for training meta learning (MAML and PEARL) baselines.
     """
-    def __init__(self, data_dir, domain_task, input_to_model, seed, device=None):
+    def __init__(self, data_dir, domain_task, input_to_model, seed, device):
         super().__init__(data_dir, domain_task, input_to_model, seed, device)
 
     def _load_dataset(self, flatten=False):

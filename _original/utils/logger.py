@@ -3,6 +3,8 @@ import datetime
 from collections import defaultdict
 
 import numpy as np
+import torch
+import torchvision
 from termcolor import colored
 from torch.utils.tensorboard import SummaryWriter
 
@@ -132,8 +134,7 @@ class Logger(object):
 
     def log(self, key, value, step):
         assert key.startswith('train') or key.startswith('eval')
-        # Handle JAX arrays and other numeric types
-        if hasattr(value, 'item'):
+        if type(value) == torch.Tensor:
             value = value.item()
         self._try_sw_log(key, value, step)
         mg = self._train_mg if key.startswith('train') else self._eval_mg

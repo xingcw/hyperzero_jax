@@ -6,22 +6,33 @@ import os
 import git
 import json
 from pathlib import Path
-from contextlib import contextmanager
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
+from torch import distributions as pyd
+from torch.distributions.utils import _standard_normal
 
 
 _STATE_AGENTS = ['td3', 'random', 'lapleig']
 _PIXEL_AGENTS = ['drqv2', 'random']
 
 
-@contextmanager
-def eval_mode(*models):
-    """No-op context manager. Flax has no train/eval mode for these architectures."""
-    yield
+class eval_mode:
+    def __init__(self, *models):
+        self.models = models
+
+    def __enter__(self):
+        self.prev_states = []
+        for model in self.models:
+            self.prev_states.append(model.training)
+            model.train(False)
+
+    def __exit__(self, *args):
+        for model, state in zip(self.models, self.prev_states):
+            model.train(state)
+        return False
 
 
 def assert_agent(agent_name, pixel_obs):
@@ -33,41 +44,53 @@ def assert_agent(agent_name, pixel_obs):
 
 
 def set_seed_everywhere(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    return jax.random.PRNGKey(seed)
 
 
-def soft_update_params(params, target_params, tau):
-    return jax.tree.map(
-        lambda p, tp: tau * p + (1 - tau) * tp,
-        params, target_params
-    )
+def soft_update_params(net, target_net, tau):
+    for param, target_param in zip(net.parameters(), target_net.parameters()):
+        target_param.data.copy_(tau * param.data +
+                                (1 - tau) * target_param.data)
 
 
-def to_jax(xs):
-    return tuple(jnp.asarray(x) for x in xs)
+def to_torch(xs, device):
+    return tuple(torch.as_tensor(x, device=device) for x in xs)
 
 
-def to_device(xs):
-    """No-op: JAX arrays auto-placed on default device."""
-    return xs
+def to_device(xs, device):
+    return tuple(x.to(device) for x in xs)
 
 
 def select_indices(xs, indices):
     return tuple(x[indices] for x in xs)
 
 
-def preprocess_obs(obs, rng_key, bits=5):
+def preprocess_obs(obs, bits=5):
     """Preprocessing image, see https://arxiv.org/abs/1807.03039."""
     bins = 2**bits
-    assert obs.dtype == jnp.float32
+    assert obs.dtype == torch.float32
     if bits < 8:
-        obs = jnp.floor(obs / 2**(8 - bits))
+        obs = torch.floor(obs / 2**(8 - bits))
     obs = obs / bins
-    obs = obs + jax.random.uniform(rng_key, obs.shape) / bins
+    obs = obs + torch.rand_like(obs) / bins
     obs = obs - 0.5
     return obs
+
+
+def weight_init(m):
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight.data)
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        gain = nn.init.calculate_gain('relu')
+        nn.init.orthogonal_(m.weight.data, gain)
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0.0)
 
 
 def save_cfg(cfg, dir):
@@ -146,12 +169,28 @@ class Timer:
         return time.time() - self._start_time
 
 
-def truncated_normal(rng_key, loc, scale, shape, low=-1.0, high=1.0, eps=1e-6):
-    """Sample from truncated normal distribution."""
-    noise = jax.random.normal(rng_key, shape) * scale
-    x = loc + noise
-    x = jnp.clip(x, low + eps, high - eps)
-    return x
+class TruncatedNormal(pyd.Normal):
+    def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
+        super().__init__(loc, scale, validate_args=False)
+        self.low = low
+        self.high = high
+        self.eps = eps
+
+    def _clamp(self, x):
+        clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
+        x = x - x.detach() + clamped_x.detach()
+        return x
+
+    def sample(self, clip=None, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        eps = _standard_normal(shape,
+                               dtype=self.loc.dtype,
+                               device=self.loc.device)
+        eps *= self.scale
+        if clip is not None:
+            eps = torch.clamp(eps, -clip, clip)
+        x = self.loc + eps
+        return self._clamp(x)
 
 
 def schedule(schdl, step):

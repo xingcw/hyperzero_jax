@@ -10,7 +10,6 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 import os
 import platform
 import logging
-import pickle
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
@@ -21,7 +20,7 @@ from pathlib import Path
 import hydra
 import omegaconf
 import numpy as np
-import jax
+import torch
 from dm_env import specs
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
@@ -32,8 +31,10 @@ from utils.logger import Logger
 from utils.replay_buffer import ReplayBufferStorage, make_replay_loader
 from utils.video import TrainVideoRecorder, VideoRecorder
 
+torch.backends.cudnn.benchmark = True
+
 # If using multirun, set the GPUs here:
-AVAILABLE_GPUS = [0, 1, 2, 3, 4]
+AVAILABLE_GPUS = [1, 2, 3, 4, 0]
 
 
 def make_agent(obs_spec, action_spec, cfg, device=None):
@@ -49,7 +50,8 @@ class Workspace:
         self.work_dir = Path.cwd()
 
         self.cfg = cfg
-        self.rng_key = utils.set_seed_everywhere(cfg.seed)
+        utils.set_seed_everywhere(cfg.seed)
+        self.device = torch.device(cfg.device)
         self.setup()
 
         self.agent = make_agent(self.train_env.observation_spec(),
@@ -138,7 +140,7 @@ class Workspace:
             time_step = self.eval_env.reset()
             self.video_recorder.init(self.eval_env, enabled=episode == 0)
             while not time_step.last():
-                with utils.eval_mode(self.agent):
+                with torch.no_grad(), utils.eval_mode(self.agent):
                     action = self.agent.act(time_step.observation,
                                             self.global_step,
                                             eval_mode=True)
@@ -213,7 +215,7 @@ class Workspace:
                     self.save_snapshot()
 
             # sample action
-            with utils.eval_mode(self.agent):
+            with torch.no_grad(), utils.eval_mode(self.agent):
                 action = self.agent.act(time_step.observation,
                                         self.global_step,
                                         eval_mode=False)
@@ -232,32 +234,18 @@ class Workspace:
             self._global_step += 1
 
     def save_snapshot(self):
-        snapshot = self.work_dir / 'snapshot.pkl'
-        keys_to_save = ['timer', '_global_step', '_global_episode']
+        snapshot = self.work_dir / 'snapshot.pt'
+        keys_to_save = ['agent', 'timer', '_global_step', '_global_episode']
         payload = {k: self.__dict__[k] for k in keys_to_save}
-        # Save agent state separately
-        payload['agent_actor_params'] = jax.device_get(self.agent.actor_state.params)
-        payload['agent_critic_params'] = jax.device_get(self.agent.critic_state.params)
-        payload['agent_actor_target'] = jax.device_get(self.agent.actor_target_params)
-        payload['agent_critic_target'] = jax.device_get(self.agent.critic_target_params)
         with snapshot.open('wb') as f:
-            pickle.dump(payload, f)
+            torch.save(payload, f)
 
     def load_snapshot(self):
-        snapshot = self.work_dir / 'snapshot.pkl'
+        snapshot = self.work_dir / 'snapshot.pt'
         with snapshot.open('rb') as f:
-            payload = pickle.load(f)
-        self.timer = payload['timer']
-        self._global_step = payload['_global_step']
-        self._global_episode = payload['_global_episode']
-        self.agent.actor_state = self.agent.actor_state.replace(
-            params=jax.device_put(payload['agent_actor_params'])
-        )
-        self.agent.critic_state = self.agent.critic_state.replace(
-            params=jax.device_put(payload['agent_critic_params'])
-        )
-        self.agent.actor_target_params = jax.device_put(payload['agent_actor_target'])
-        self.agent.critic_target_params = jax.device_put(payload['agent_critic_target'])
+            payload = torch.load(f)
+        for k, v in payload.items():
+            self.__dict__[k] = v
 
 
 @hydra.main(version_base=None, config_path='cfgs', config_name='config')
@@ -265,14 +253,14 @@ def main(cfg):
     log = logging.getLogger(__name__)
     try:
         device_id = AVAILABLE_GPUS[HydraConfig.get().job.num % len(AVAILABLE_GPUS)]
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
-        log.info(f"Total number of GPUs is {AVAILABLE_GPUS}, running on GPU {device_id}.")
+        cfg.device = f"{cfg.device}:{device_id}"
+        log.info(f"Total number of GPUs is {AVAILABLE_GPUS}, running on {cfg.device}.")
     except omegaconf.errors.MissingMandatoryValue:
         pass
 
     root_dir = Path.cwd()
     workspace = Workspace(cfg)
-    snapshot = root_dir / 'snapshot.pkl'
+    snapshot = root_dir / 'snapshot.pt'
     if snapshot.exists():
         print(f'resuming: {snapshot}')
         workspace.load_snapshot()
