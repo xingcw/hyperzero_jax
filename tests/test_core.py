@@ -9,6 +9,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import jax
+# Enable float64 so PyTorch/JAX equivalence tests run in full precision
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 import torch
@@ -39,22 +41,23 @@ from tests.conftest import (
 
 class TestDeterministicActor:
     def test_equivalence(self):
-        """Same weights + input -> same output."""
+        """Same weights + input -> same output (float64 for numerical stability)."""
         feature_dim, action_dim, hidden_dim = 8, 4, 64
         batch_size = 16
         np.random.seed(42)
-        input_np = np.random.randn(batch_size, feature_dim).astype(np.float32)
+        input_np = np.random.randn(batch_size, feature_dim).astype(np.float64)
 
-        # PyTorch
+        # PyTorch (float64)
         torch_model = TorchActor(feature_dim, action_dim, hidden_dim)
+        torch_model.double()
         torch_model.eval()
         with torch.no_grad():
-            torch_out = torch_model(torch.tensor(input_np)).numpy()
+            torch_out = torch_model(torch.tensor(input_np, dtype=torch.float64)).numpy()
 
-        # JAX
+        # JAX (float64; transfer gives float64 params from .double() model)
         jax_model = JaxActor(action_dim=action_dim, hidden_dim=hidden_dim)
         jax_params = transfer_deterministic_actor(torch_model)
-        jax_out = jax_model.apply(jax_params, jnp.array(input_np))
+        jax_out = jax_model.apply(jax_params, jnp.array(input_np, dtype=jnp.float64))
 
         np.testing.assert_allclose(np.array(jax_out), torch_out, rtol=RTOL, atol=ATOL)
 
@@ -71,87 +74,114 @@ class TestDeterministicActor:
 
 class TestCritic:
     def test_equivalence(self):
-        """Q1 and Q2 match."""
+        """Q1 and Q2 match (float64 for numerical stability)."""
         feature_dim, action_dim, hidden_dim = 8, 4, 64
         batch_size = 16
         np.random.seed(42)
-        state_np = np.random.randn(batch_size, feature_dim).astype(np.float32)
-        action_np = np.random.randn(batch_size, action_dim).astype(np.float32)
+        state_np = np.random.randn(batch_size, feature_dim).astype(np.float64)
+        action_np = np.random.randn(batch_size, action_dim).astype(np.float64)
 
-        # PyTorch
+        # PyTorch (float64)
         torch_model = TorchCritic(feature_dim, action_dim, hidden_dim)
+        torch_model.double()
         torch_model.eval()
         with torch.no_grad():
-            torch_q1, torch_q2 = torch_model(torch.tensor(state_np), torch.tensor(action_np))
+            torch_q1, torch_q2 = torch_model(
+                torch.tensor(state_np, dtype=torch.float64),
+                torch.tensor(action_np, dtype=torch.float64),
+            )
             torch_q1 = torch_q1.numpy()
             torch_q2 = torch_q2.numpy()
 
-        # JAX
+        # JAX (float64)
         jax_model = JaxCritic(hidden_dim=hidden_dim)
         jax_params = transfer_critic(torch_model)
-        jax_q1, jax_q2 = jax_model.apply(jax_params, jnp.array(state_np), jnp.array(action_np))
+        jax_q1, jax_q2 = jax_model.apply(
+            jax_params,
+            jnp.array(state_np, dtype=jnp.float64),
+            jnp.array(action_np, dtype=jnp.float64),
+        )
 
         np.testing.assert_allclose(np.array(jax_q1), torch_q1, rtol=RTOL, atol=ATOL)
         np.testing.assert_allclose(np.array(jax_q2), torch_q2, rtol=RTOL, atol=ATOL)
 
     def test_q1_only(self):
-        """Standalone Q1 path matches."""
+        """Standalone Q1 path matches (float64 for numerical stability)."""
         feature_dim, action_dim, hidden_dim = 8, 4, 64
         batch_size = 16
         np.random.seed(42)
-        state_np = np.random.randn(batch_size, feature_dim).astype(np.float32)
-        action_np = np.random.randn(batch_size, action_dim).astype(np.float32)
+        state_np = np.random.randn(batch_size, feature_dim).astype(np.float64)
+        action_np = np.random.randn(batch_size, action_dim).astype(np.float64)
 
-        # PyTorch
+        # PyTorch (float64)
         torch_model = TorchCritic(feature_dim, action_dim, hidden_dim)
+        torch_model.double()
         torch_model.eval()
         with torch.no_grad():
-            torch_q1 = torch_model.Q1(torch.tensor(state_np), torch.tensor(action_np)).numpy()
+            torch_q1 = torch_model.Q1(
+                torch.tensor(state_np, dtype=torch.float64),
+                torch.tensor(action_np, dtype=torch.float64),
+            ).numpy()
 
-        # JAX
+        # JAX (float64)
         jax_model = JaxCritic(hidden_dim=hidden_dim)
         jax_params = transfer_critic(torch_model)
-        jax_q1 = jax_model.apply(jax_params, jnp.array(state_np), jnp.array(action_np),
-                                  method=jax_model.Q1)
+        jax_q1 = jax_model.apply(
+            jax_params,
+            jnp.array(state_np, dtype=jnp.float64),
+            jnp.array(action_np, dtype=jnp.float64),
+            method=jax_model.Q1,
+        )
 
         np.testing.assert_allclose(np.array(jax_q1), torch_q1, rtol=RTOL, atol=ATOL)
 
 
 class TestGaussianLogprob:
     def test_equivalence(self):
+        """Float64 for numerical stability."""
         np.random.seed(42)
-        noise_np = np.random.randn(16, 4).astype(np.float32)
-        log_std_np = np.random.randn(16, 4).astype(np.float32)
+        noise_np = np.random.randn(16, 4).astype(np.float64)
+        log_std_np = np.random.randn(16, 4).astype(np.float64)
 
         # PyTorch
         torch_result = torch_gaussian_logprob(
-            torch.tensor(noise_np), torch.tensor(log_std_np)
+            torch.tensor(noise_np, dtype=torch.float64),
+            torch.tensor(log_std_np, dtype=torch.float64),
         ).numpy()
 
         # JAX
-        jax_result = jax_gaussian_logprob(jnp.array(noise_np), jnp.array(log_std_np))
+        jax_result = jax_gaussian_logprob(
+            jnp.array(noise_np, dtype=jnp.float64),
+            jnp.array(log_std_np, dtype=jnp.float64),
+        )
 
         np.testing.assert_allclose(np.array(jax_result), torch_result, rtol=RTOL, atol=ATOL)
 
 
 class TestSquash:
     def test_equivalence(self):
+        """Float64 for numerical stability."""
         np.random.seed(42)
-        mu_np = np.random.randn(16, 4).astype(np.float32)
-        pi_np = np.random.randn(16, 4).astype(np.float32) * 0.5  # keep moderate for numerical stability
-        log_pi_np = np.random.randn(16, 1).astype(np.float32)
+        mu_np = np.random.randn(16, 4).astype(np.float64)
+        pi_np = np.random.randn(16, 4).astype(np.float64) * 0.5  # keep moderate for numerical stability
+        log_pi_np = np.random.randn(16, 1).astype(np.float64)
 
         # PyTorch
         torch_mu, torch_pi, torch_log_pi = torch_squash(
-            torch.tensor(mu_np), torch.tensor(pi_np), torch.tensor(log_pi_np)
+            torch.tensor(mu_np, dtype=torch.float64),
+            torch.tensor(pi_np, dtype=torch.float64),
+            torch.tensor(log_pi_np, dtype=torch.float64),
         )
 
         # JAX
         jax_mu, jax_pi, jax_log_pi = jax_squash(
-            jnp.array(mu_np), jnp.array(pi_np), jnp.array(log_pi_np)
+            jnp.array(mu_np, dtype=jnp.float64),
+            jnp.array(pi_np, dtype=jnp.float64),
+            jnp.array(log_pi_np, dtype=jnp.float64),
         )
 
         np.testing.assert_allclose(np.array(jax_mu), torch_mu.numpy(), rtol=RTOL, atol=ATOL)
         np.testing.assert_allclose(np.array(jax_pi), torch_pi.numpy(), rtol=RTOL, atol=ATOL)
-        np.testing.assert_allclose(np.array(jax_log_pi), torch_log_pi.detach().numpy(),
-                                   rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(
+            np.array(jax_log_pi), torch_log_pi.detach().numpy(), rtol=RTOL, atol=ATOL
+        )
