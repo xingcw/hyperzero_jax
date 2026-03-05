@@ -7,7 +7,8 @@ import platform
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-    os.environ['MUJOCO_GL'] = 'egl'
+    # Disable MuJoCo rendering (not needed for physics-only on TPU)
+    os.environ['MUJOCO_GL'] = 'disable'
 
 import argparse
 from pathlib import Path
@@ -20,7 +21,6 @@ from collections import defaultdict
 import jax
 import jax.numpy as jnp
 
-import utils.dmc as dmc
 import utils.utils as utils
 import utils.plots as plots
 from train import make_agent
@@ -115,22 +115,22 @@ class Workspace:
         except omegaconf.errors.ConfigAttributeError:
             dynamics_parameters = {'use_default': True}
 
-        # create envs with equal but independent random generators
-        rg_1 = np.random.RandomState(self.cfg.seed)
-        rg_2 = np.random.RandomState(self.cfg.seed)
-
-        self.eval_env_rl_agent = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                          self.cfg.action_repeat, reward_parameters,
-                                          dynamics_parameters, rg_1, self.cfg.pixel_obs)
-        self.eval_env_rl_approx = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                           self.cfg.action_repeat, reward_parameters,
-                                           dynamics_parameters, rg_2, self.cfg.pixel_obs)
-
-        try:
-            _module = self.eval_env_rl_agent.task.__module__
-            self.domain = _module.rpartition('.')[-1]
-        except AttributeError:
-            self.domain = None
+        # create envs (Brax only; no DMC/suite)
+        from utils import brax as brax_env
+        brax_episode_length = getattr(self.cfg, 'brax_episode_length', 1000)
+        self.eval_env_rl_agent = brax_env.make(
+            self.cfg.task_name, self.cfg.frame_stack,
+            self.cfg.action_repeat, reward_parameters,
+            dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs,
+            episode_length=brax_episode_length,
+        )
+        self.eval_env_rl_approx = brax_env.make(
+            self.cfg.task_name, self.cfg.frame_stack,
+            self.cfg.action_repeat, reward_parameters,
+            dynamics_parameters, self.cfg.seed + 1, self.cfg.pixel_obs,
+            episode_length=brax_episode_length,
+        )
+        self.domain = self.cfg.task_name.split('_')[0] if '_' in self.cfg.task_name else None
 
         self.video_recorder = VideoRecorder(
             self.video_dir,

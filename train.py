@@ -14,7 +14,8 @@ import pickle
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-    os.environ['MUJOCO_GL'] = 'egl'
+    # Disable MuJoCo rendering (not needed for physics-only on TPU)
+    os.environ['MUJOCO_GL'] = 'disable'
 
 from pathlib import Path
 
@@ -22,15 +23,14 @@ import hydra
 import omegaconf
 import numpy as np
 import jax
-from dm_env import specs
+from utils.env_common import ArraySpec
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
-import utils.dmc as dmc
 import utils.utils as utils
 from utils.logger import Logger
 from utils.replay_buffer import ReplayBufferStorage, make_replay_loader
-from utils.video import TrainVideoRecorder, VideoRecorder
+# from utils.video import TrainVideoRecorder, VideoRecorder
 
 # If using multirun, set the GPUs here:
 AVAILABLE_GPUS = [0, 1, 2, 3, 4]
@@ -62,28 +62,41 @@ class Workspace:
     def setup(self):
         # some assertions
         utils.assert_agent(self.cfg['agent_name'], self.cfg['pixel_obs'])
+        simulator = getattr(self.cfg, 'simulator', 'brax')
+        if simulator != 'brax':
+            raise ValueError('Only simulator=brax is supported (DMC/suite disabled for TPU/headless).')
+        if self.cfg.pixel_obs:
+            raise ValueError('Brax is state-only; set obs@_global_: states (pixel_obs=false).')
 
         # create logger
         self.logger = Logger(self.work_dir)
 
-        # get the reward parameters
+        # get the reward parameters (used only for DMC)
         reward_parameters = OmegaConf.to_container(self.cfg.reward_parameters)
 
-        # get the dynamics parameters
+        # get the dynamics parameters (used only for DMC)
         dynamics_parameters = OmegaConf.to_container(self.cfg.dynamics_parameters)
 
-        # create envs
-        self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                  self.cfg.action_repeat, reward_parameters,
-                                  dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs)
-        self.eval_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                 self.cfg.action_repeat, reward_parameters,
-                                 dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs)
+        # create envs (Brax only; no DMC/suite for TPU/headless)
+        from utils import brax as brax_env
+        brax_episode_length = getattr(self.cfg, 'brax_episode_length', 1000)
+        self.train_env = brax_env.make(
+            self.cfg.task_name, self.cfg.frame_stack,
+            self.cfg.action_repeat, reward_parameters,
+            dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs,
+            episode_length=brax_episode_length,
+        )
+        self.eval_env = brax_env.make(
+            self.cfg.task_name, self.cfg.frame_stack,
+            self.cfg.action_repeat, reward_parameters,
+            dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs,
+            episode_length=brax_episode_length,
+        )
         # create replay buffer
         data_specs = (self.train_env.observation_spec(),
                       self.train_env.action_spec(),
-                      specs.Array((1,), np.float32, 'reward'),
-                      specs.Array((1,), np.float32, 'discount'))
+                      ArraySpec((1,), np.float32, 'reward'),
+                      ArraySpec((1,), np.float32, 'discount'))
 
         self.replay_storage = ReplayBufferStorage(data_specs,
                                                   self.work_dir / 'buffer')
@@ -94,14 +107,14 @@ class Workspace:
             self.cfg.save_snapshot, self.cfg.nstep, self.cfg.discount)
         self._replay_iter = None
 
-        self.video_recorder = VideoRecorder(
-            self.work_dir if self.cfg.save_video else None,
-            fps=60 // self.cfg.action_repeat
-        )
-        self.train_video_recorder = TrainVideoRecorder(
-            self.work_dir if self.cfg.save_train_video else None,
-            fps=60 // self.cfg.action_repeat
-        )
+        # self.video_recorder = VideoRecorder(
+        #     self.work_dir if self.cfg.save_video else None,
+        #     fps=60 // self.cfg.action_repeat
+        # )
+        # self.train_video_recorder = TrainVideoRecorder(
+        #     self.work_dir if self.cfg.save_train_video else None,
+        #     fps=60 // self.cfg.action_repeat
+        # )
 
         self.plot_dir = self.work_dir / 'plots'
         self.plot_dir.mkdir(exist_ok=True)
@@ -136,19 +149,19 @@ class Workspace:
 
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
-            self.video_recorder.init(self.eval_env, enabled=episode == 0)
+            # self.video_recorder.init(self.eval_env, enabled=episode == 0)
             while not time_step.last():
                 with utils.eval_mode(self.agent):
                     action = self.agent.act(time_step.observation,
                                             self.global_step,
                                             eval_mode=True)
                 time_step = self.eval_env.step(action)
-                self.video_recorder.record(self.eval_env)
+                # self.video_recorder.record(self.eval_env)
                 total_reward += time_step.reward
                 step += 1
 
             episode += 1
-            self.video_recorder.save(f'{self.global_frame}_{episode}.mp4')
+            # self.video_recorder.save(f'{self.global_frame}_{episode}.mp4')
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             log('episode_reward', total_reward / episode)
@@ -172,12 +185,12 @@ class Workspace:
         episode_step, episode_reward = 0, 0
         time_step = self.train_env.reset()
         self.replay_storage.add(time_step)
-        self.train_video_recorder.init(time_step.observation)
+        # self.train_video_recorder.init(time_step.observation)
         metrics = None
         while train_until_step(self.global_step):
             if time_step.last():
                 self._global_episode += 1
-                self.train_video_recorder.save(f'{self.global_frame}.mp4')
+                # self.train_video_recorder.save(f'{self.global_frame}.mp4')
                 # wait until all the metrics schema is populated
                 if metrics is not None:
                     # log stats
@@ -196,7 +209,7 @@ class Workspace:
                 # reset env
                 time_step = self.train_env.reset()
                 self.replay_storage.add(time_step)
-                self.train_video_recorder.init(time_step.observation)
+                # self.train_video_recorder.init(time_step.observation)
                 episode_step = 0
                 episode_reward = 0
 
@@ -227,7 +240,7 @@ class Workspace:
             time_step = self.train_env.step(action)
             episode_reward += time_step.reward
             self.replay_storage.add(time_step)
-            self.train_video_recorder.record(time_step.observation)
+            # self.train_video_recorder.record(time_step.observation)
             episode_step += 1
             self._global_step += 1
 

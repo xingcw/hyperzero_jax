@@ -7,6 +7,10 @@ defaults:
   - dynamics@_global_: default
   - override hydra/launcher: submitit_local
 
+# simulator: brax only (DMC/suite disabled for TPU/headless)
+simulator: brax
+brax_episode_length: 1000
+
 # task settings
 discount: 0.99
 # train settings
@@ -28,7 +32,7 @@ batch_size: 256
 # misc
 seed: 2
 device: cuda
-save_video: true
+save_video: false
 save_train_video: false
 # experiment
 experiment: ''

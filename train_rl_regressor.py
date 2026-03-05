@@ -15,7 +15,8 @@ import pickle
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-    os.environ['MUJOCO_GL'] = 'egl'
+    # Disable MuJoCo rendering (not needed for physics-only on TPU)
+    os.environ['MUJOCO_GL'] = 'disable'
 
 from pathlib import Path
 

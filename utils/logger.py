@@ -4,7 +4,7 @@ from collections import defaultdict
 
 import numpy as np
 from termcolor import colored
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 TB_LOG_FREQ = 10
 COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
@@ -124,18 +124,32 @@ class Logger(object):
                                      formating=COMMON_TRAIN_FORMAT)
         self._eval_mg = MetersGroup(log_dir / 'eval.csv',
                                     formating=COMMON_EVAL_FORMAT)
-        self._sw = SummaryWriter(str(log_dir / 'tb'))
 
-    def _try_sw_log(self, key, value, step):
-        if self._sw is not None and step % TB_LOG_FREQ == 0:
-            self._sw.add_scalar(key, value, step)
+        # Initialize Weights & Biases run for scalar logging. If wandb
+        # is unavailable or misconfigured, we gracefully fall back to
+        # CSV/console logging only.
+        self._wandb_enabled = False
+        try:
+            if wandb.run is None:
+                wandb.init(
+                    project="hyperzero-jax",
+                    dir=str(log_dir),
+                    reinit=True,
+                )
+            self._wandb_enabled = True
+        except Exception:
+            self._wandb_enabled = False
+
+    def _try_wandb_log(self, key, value, step):
+        if self._wandb_enabled and step % TB_LOG_FREQ == 0:
+            wandb.log({key: value, "step": step}, step=step)
 
     def log(self, key, value, step):
         assert key.startswith('train') or key.startswith('eval')
         # Handle JAX arrays and other numeric types
         if hasattr(value, 'item'):
             value = value.item()
-        self._try_sw_log(key, value, step)
+        self._try_wandb_log(key, value, step)
         mg = self._train_mg if key.startswith('train') else self._eval_mg
         mg.log(key, value)
 
