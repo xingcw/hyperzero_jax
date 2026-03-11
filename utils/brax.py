@@ -127,6 +127,111 @@ class BraxWrapper:
         )
 
 
+class VectorizedBraxWrapper:
+    """
+    Vectorized Brax env using pmap across all TPU/GPU devices.
+    Each device runs n_envs_per_device envs (auto_reset=True).
+    Total envs = n_devices * n_envs_per_device.
+
+    Both reset and step are pmap'd + JIT-compiled, so all devices do
+    env work in parallel. Returns flat numpy arrays (n_envs, ...).
+    """
+
+    def __init__(self, env, n_devices, n_envs_per_device, seed):
+        import jax
+        self._env = env
+        self._n_devices = n_devices
+        self._n_envs_per_device = n_envs_per_device
+        self._n_envs = n_devices * n_envs_per_device
+        self._rng = jax.random.PRNGKey(seed)
+        self._state = None
+
+        # Determine obs/action sizes via a cheap single-device reset
+        _state0 = env.reset(jax.random.PRNGKey(0))
+        self._obs_size = int(np.array(_state0.obs).shape[-1])
+        self._action_size = int(env.action_size)
+
+        # pmap'd reset and step — compiled once, runs on all devices every call
+        self._pmap_reset = jax.pmap(env.reset)
+        self._pmap_step = jax.pmap(env.step)
+
+    @property
+    def n_envs(self):
+        return self._n_envs
+
+    @property
+    def obs_size(self):
+        return self._obs_size
+
+    @property
+    def action_size(self):
+        return self._action_size
+
+    def observation_spec(self):
+        return ArraySpec(shape=(self._obs_size,), dtype=np.float32, name='observation')
+
+    def action_spec(self):
+        return BoundedArraySpec(
+            shape=(self._action_size,), dtype=np.float32,
+            minimum=-1.0, maximum=1.0, name='action',
+        )
+
+    def reset(self):
+        """Reset all envs on all devices. Returns obs of shape (n_envs, obs_size)."""
+        import jax
+        import jax.numpy as jnp
+        self._rng, *device_rngs = jax.random.split(self._rng, self._n_devices + 1)
+        # Stack → (n_devices, 2); pmap sends each row to the corresponding device
+        device_rngs = jnp.stack(device_rngs)
+        self._state = self._pmap_reset(device_rngs)
+        return np.array(self._state.obs, dtype=np.float32).reshape(
+            self._n_envs, self._obs_size
+        )
+
+    def step(self, actions):
+        """
+        Step all envs on all devices.
+        actions: (n_envs, action_size) numpy array
+        Returns: obs (n_envs, obs_size), rewards (n_envs,), dones (n_envs,).
+        """
+        import jax.numpy as jnp
+        # Shard actions across devices: (n_devices, n_envs_per_device, action_size)
+        actions_sharded = jnp.asarray(actions, dtype=jnp.float32).reshape(
+            self._n_devices, self._n_envs_per_device, self._action_size
+        )
+        self._state = self._pmap_step(self._state, actions_sharded)
+        obs = np.array(self._state.obs, dtype=np.float32).reshape(
+            self._n_envs, self._obs_size
+        )
+        rewards = np.array(self._state.reward, dtype=np.float32).reshape(self._n_envs)
+        dones = np.array(self._state.done, dtype=np.float32).reshape(self._n_envs)
+        return obs, rewards, dones
+
+
+def make_vectorized(name, n_envs, episode_length, seed):
+    """Create a pmap-vectorized Brax env across all available devices."""
+    import jax
+    from brax import envs
+
+    n_devices = jax.device_count()
+    n_envs_per_device = max(1, n_envs // n_devices)
+
+    name = name.lower().replace('-', '_')
+    if name == 'cheetah_run':
+        name = 'halfcheetah'
+    elif name == 'walker_walk':
+        name = 'walker2d'
+
+    env = envs.create(
+        env_name=name,
+        episode_length=episode_length,
+        action_repeat=1,
+        auto_reset=True,
+        batch_size=n_envs_per_device,
+    )
+    return VectorizedBraxWrapper(env, n_devices, n_envs_per_device, seed=seed)
+
+
 def make(
     name,
     frame_stack,

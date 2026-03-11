@@ -2,6 +2,7 @@
 Proximal Policy Optimization (PPO) with GAE.
 Continuous actions via diagonal Gaussian policy.
 
+Multi-device training via jax.pmap with lax.pmean gradient averaging.
 Compatible interface with TD3Agent: act(), observe(), save(), load().
 On-policy training is handled externally by train_ppo.py.
 """
@@ -35,7 +36,7 @@ class GaussianActor(nn.Module):
 
 
 class ValueFunction(nn.Module):
-    """State value estimator V(s). Used to label the dataset in place of Q(s,a)."""
+    """State value estimator V(s)."""
     hidden_dim: int
 
     @nn.compact
@@ -50,13 +51,10 @@ class ValueFunction(nn.Module):
 
 class PPOAgent:
     """
-    PPO agent for continuous control.
+    PPO agent for continuous control with multi-device (pmap) training support.
 
-    act() / observe() / save() / load() match the TD3Agent interface
-    so eval.py and the rollout pipeline work without changes.
-
+    act() / observe() / save() / load() match the TD3Agent interface.
     Training is done in train_ppo.py via update(rollout_data, step).
-    The rollout_data dict is produced by collect_rollouts() there.
     """
 
     def __init__(self, obs_shape, action_shape, device, lr, hidden_dim,
@@ -71,6 +69,7 @@ class PPOAgent:
         self.n_epochs = n_epochs
         self.minibatch_size = minibatch_size
         self.max_grad_norm = max_grad_norm
+        self.n_devices = jax.device_count()
 
         rng_key = jax.random.PRNGKey(0)
         rng_key, actor_key, critic_key = jax.random.split(rng_key, 3)
@@ -100,6 +99,79 @@ class PPOAgent:
             ),
         )
 
+        # Replicated states for pmap (lazily initialized on first update())
+        self._actor_state_rep = None
+        self._critic_state_rep = None
+
+        # Build pmap update function (captures hyperparams + apply_fns in closure)
+        self._pmap_update = self._build_pmap_update()
+
+    def _build_pmap_update(self):
+        """Build a pmap'd update step with gradient averaging via lax.pmean."""
+        actor_apply = self.actor_module.apply
+        critic_apply = self.critic_module.apply
+        clip_eps = self.clip_eps
+        value_coef = self.value_coef
+        entropy_coef = self.entropy_coef
+
+        @partial(jax.pmap, axis_name='devices')
+        def pmap_update(actor_state, critic_state,
+                        obs, actions, old_log_probs, advantages, returns):
+            def loss_fn(actor_params, critic_params):
+                mean, log_std = actor_apply({'params': actor_params}, obs)
+                std = jnp.exp(log_std)
+                log_probs = (
+                    -0.5 * (((actions - mean) / std) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi))
+                ).sum(-1)
+
+                ratio = jnp.exp(log_probs - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+                actor_loss = -jnp.mean(jnp.minimum(surr1, surr2))
+
+                entropy = 0.5 * jnp.sum(jnp.log(2 * jnp.pi * jnp.e * std ** 2))
+                entropy_loss = -entropy_coef * entropy
+
+                values = critic_apply({'params': critic_params}, obs)
+                value_loss = value_coef * jnp.mean((values - returns) ** 2)
+
+                total_loss = actor_loss + entropy_loss + value_loss
+                return total_loss, (actor_loss, value_loss, entropy_loss,
+                                    jnp.mean(jnp.abs(ratio - 1)))
+
+            (_, aux), grads = jax.value_and_grad(
+                loss_fn, argnums=(0, 1), has_aux=True
+            )(actor_state.params, critic_state.params)
+
+            # Average gradients across all devices
+            actor_grads = jax.lax.pmean(grads[0], axis_name='devices')
+            critic_grads = jax.lax.pmean(grads[1], axis_name='devices')
+
+            actor_state = actor_state.apply_gradients(grads=actor_grads)
+            critic_state = critic_state.apply_gradients(grads=critic_grads)
+
+            # Average metrics across devices for consistent logging
+            metrics = jax.lax.pmean(jnp.stack(aux), axis_name='devices')
+            return actor_state, critic_state, metrics
+
+        return pmap_update
+
+    def _get_replicated_states(self):
+        """Lazily replicate train states across all devices."""
+        if self._actor_state_rep is None:
+            self._actor_state_rep = jax.device_put_replicated(
+                self.actor_state, jax.devices()
+            )
+            self._critic_state_rep = jax.device_put_replicated(
+                self.critic_state, jax.devices()
+            )
+        return self._actor_state_rep, self._critic_state_rep
+
+    def _invalidate_replicated_states(self):
+        """Force re-replication on next update (e.g., after load_snapshot)."""
+        self._actor_state_rep = None
+        self._critic_state_rep = None
+
     # ------------------------------------------------------------------
     # eval.py interface
     # ------------------------------------------------------------------
@@ -118,7 +190,7 @@ class PPOAgent:
         return np.asarray(action, dtype=np.float32)
 
     def observe(self, obs, action):
-        """Return V(s) as value estimate for dataset labelling (replaces Q(s,a))."""
+        """Return V(s) as value estimate for dataset labelling."""
         obs_jax = jnp.asarray(obs, dtype=jnp.float32)[None]
         value = self.critic_module.apply({'params': self.critic_state.params}, obs_jax)
         return {
@@ -127,7 +199,7 @@ class PPOAgent:
         }
 
     # ------------------------------------------------------------------
-    # train_ppo.py helpers
+    # train_ppo.py helpers (kept for backward compatibility)
     # ------------------------------------------------------------------
 
     def get_value(self, obs):
@@ -158,50 +230,8 @@ class PPOAgent:
         return np.asarray(action), np.asarray(log_prob), np.asarray(value)
 
     # ------------------------------------------------------------------
-    # PPO update (JIT-compiled minibatch step)
+    # PPO update — pmap across devices with pmean gradient averaging
     # ------------------------------------------------------------------
-
-    @staticmethod
-    @partial(jax.jit, static_argnames=('actor_apply_fn', 'critic_apply_fn',
-                                       'clip_eps', 'value_coef', 'entropy_coef'))
-    def _ppo_update_step(actor_state, critic_state, actor_apply_fn, critic_apply_fn,
-                         obs, actions, old_log_probs, advantages, returns,
-                         clip_eps, value_coef, entropy_coef):
-        def loss_fn(actor_params, critic_params):
-            mean, log_std = actor_apply_fn({'params': actor_params}, obs)
-            std = jnp.exp(log_std)
-            log_probs = (
-                -0.5 * (((actions - mean) / std) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi))
-            ).sum(-1)
-
-            ratio = jnp.exp(log_probs - old_log_probs)
-            surr1 = ratio * advantages
-            surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
-            actor_loss = -jnp.mean(jnp.minimum(surr1, surr2))
-
-            entropy = 0.5 * jnp.sum(jnp.log(2 * jnp.pi * jnp.e * std ** 2))
-            entropy_loss = -entropy_coef * entropy
-
-            values = critic_apply_fn({'params': critic_params}, obs)
-            value_loss = value_coef * jnp.mean((values - returns) ** 2)
-
-            total_loss = actor_loss + entropy_loss + value_loss
-            return total_loss, (actor_loss, value_loss, entropy_loss,
-                                jnp.mean(jnp.abs(ratio - 1)))
-
-        (_, aux), grads = jax.value_and_grad(
-            lambda ap, cp: loss_fn(ap, cp), argnums=(0, 1), has_aux=True
-        )(actor_state.params, critic_state.params)
-        actor_grads, critic_grads = grads
-        actor_state = actor_state.apply_gradients(grads=actor_grads)
-        critic_state = critic_state.apply_gradients(grads=critic_grads)
-        actor_loss, value_loss, entropy_loss, approx_kl = aux
-        return actor_state, critic_state, {
-            'actor_loss': actor_loss,
-            'critic_loss': value_loss,
-            'entropy_loss': entropy_loss,
-            'approx_kl': approx_kl,
-        }
 
     def update(self, rollout_data, step=None):
         """PPO update over collected on-policy rollout_data dict."""
@@ -211,24 +241,47 @@ class PPOAgent:
         advantages = jnp.asarray(rollout_data['advantages'], dtype=jnp.float32)
         returns = jnp.asarray(rollout_data['returns'], dtype=jnp.float32)
 
-        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         n = obs.shape[0]
+        n_devices = self.n_devices
+        # Ensure minibatch size is divisible by n_devices
+        mb_per_device = self.minibatch_size // n_devices
+        mb_size = mb_per_device * n_devices
+
+        actor_state_rep, critic_state_rep = self._get_replicated_states()
+
         last_metrics = {}
         for _ in range(self.n_epochs):
             self.rng_key, subkey = jax.random.split(self.rng_key)
             perm = jax.random.permutation(subkey, n)
-            for start in range(0, n, self.minibatch_size):
-                idx = perm[start:start + self.minibatch_size]
-                self.actor_state, self.critic_state, m = self._ppo_update_step(
-                    self.actor_state, self.critic_state,
-                    self.actor_module.apply, self.critic_module.apply,
-                    obs[idx], actions[idx], old_log_probs[idx],
-                    advantages[idx], returns[idx],
-                    self.clip_eps, self.value_coef, self.entropy_coef,
+
+            for start in range(0, n - mb_size + 1, mb_size):
+                idx = perm[start:start + mb_size]
+
+                def shard(x):
+                    return x[idx].reshape(n_devices, mb_per_device, *x.shape[1:])
+
+                actor_state_rep, critic_state_rep, metrics = self._pmap_update(
+                    actor_state_rep, critic_state_rep,
+                    shard(obs), shard(actions), shard(old_log_probs),
+                    shard(advantages), shard(returns),
                 )
-                last_metrics = {k: float(v) for k, v in m.items()}
+                last_metrics = {
+                    'actor_loss':   float(metrics[0]),
+                    'critic_loss':  float(metrics[1]),
+                    'entropy_loss': float(metrics[2]),
+                    'approx_kl':    float(metrics[3]),
+                }
+
+        # Save updated replicated states
+        self._actor_state_rep = actor_state_rep
+        self._critic_state_rep = critic_state_rep
+
+        # Unreplicate: extract from device 0 (all devices are in sync)
+        self.actor_state = jax.tree_util.tree_map(lambda x: x[0], actor_state_rep)
+        self.critic_state = jax.tree_util.tree_map(lambda x: x[0], critic_state_rep)
+
         return last_metrics
 
     # ------------------------------------------------------------------
@@ -256,3 +309,5 @@ class PPOAgent:
             self.critic_state = self.critic_state.replace(
                 params=jax.device_put(critic_data['params'])
             )
+        # Invalidate replicated states so next update() re-replicates fresh params
+        self._invalidate_replicated_states()

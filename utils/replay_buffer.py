@@ -159,6 +159,54 @@ class ReplayBuffer:
             yield self._sample()
 
 
+class CircularReplayBuffer:
+    """
+    Fast in-memory numpy circular buffer for off-policy RL.
+
+    Accepts batch adds (from vectorized envs) and batch samples.
+    No disk I/O — all data lives in pre-allocated numpy arrays.
+    """
+
+    def __init__(self, capacity, obs_dim, action_dim):
+        self._capacity = int(capacity)
+        self._obs = np.zeros((self._capacity, obs_dim), dtype=np.float32)
+        self._actions = np.zeros((self._capacity, action_dim), dtype=np.float32)
+        self._rewards = np.zeros(self._capacity, dtype=np.float32)
+        self._next_obs = np.zeros((self._capacity, obs_dim), dtype=np.float32)
+        self._dones = np.zeros(self._capacity, dtype=np.float32)
+        self._ptr = 0
+        self._size = 0
+
+    def add(self, obs, actions, rewards, next_obs, dones):
+        """Add a batch of N transitions."""
+        n = len(obs)
+        indices = np.arange(self._ptr, self._ptr + n) % self._capacity
+        self._obs[indices] = obs
+        self._actions[indices] = actions
+        self._rewards[indices] = rewards
+        self._next_obs[indices] = next_obs
+        self._dones[indices] = dones
+        self._ptr = (self._ptr + n) % self._capacity
+        self._size = min(self._size + n, self._capacity)
+
+    def sample(self, batch_size):
+        """Sample a random batch. Returns a dict of numpy arrays."""
+        assert self._size >= batch_size, (
+            f"Buffer has only {self._size} transitions, need {batch_size}"
+        )
+        idx = np.random.randint(0, self._size, batch_size)
+        return {
+            'obs':      self._obs[idx],
+            'actions':  self._actions[idx],
+            'rewards':  self._rewards[idx],
+            'next_obs': self._next_obs[idx],
+            'dones':    self._dones[idx],
+        }
+
+    def __len__(self):
+        return self._size
+
+
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
     np.random.seed(seed)

@@ -1,6 +1,8 @@
 """
 On-policy PPO training loop with batched Brax environments.
 
+Multi-device training via jax.pmap; fast rollouts via jax.lax.scan.
+
 Usage (same Hydra config system as train.py):
     python train_ppo.py agent@_global_=ppo task@_global_=cheetah_run \\
         reward@_global_=cheetah_default dynamics@_global_=default
@@ -21,6 +23,7 @@ import logging
 import os
 import pickle
 import platform
+from functools import partial
 from pathlib import Path
 
 if platform.system() == 'Linux':
@@ -67,66 +70,107 @@ def make_brax_env_batched(task_name, n_envs, episode_length):
     return env
 
 
-def collect_rollouts(env, agent, rng_key, n_envs, n_steps, gamma, gae_lambda):
+def make_rollout_fn(env, agent, n_steps):
     """
-    Collect n_steps transitions from all n_envs with the current policy,
-    compute GAE advantages, and return a flat rollout buffer dict.
+    Build a pmap'd rollout function using jax.lax.scan.
+
+    Each device independently collects n_steps transitions from n_envs_per_device
+    environments. The scan replaces the Python step loop, keeping computation
+    entirely on-device with no host-device transfers during rollout.
+
+    Args:
+        env: Brax env created with batch_size = n_envs_per_device.
+        agent: PPOAgent instance (actor/critic modules captured in closure).
+        n_steps: Number of steps to collect per device.
 
     Returns:
-        rollout: dict with keys obs, actions, log_probs, advantages, returns
-                 each shaped (n_steps * n_envs, ...)
-        rng_key: updated PRNG key
+        pmap'd function: (actor_params_rep, critic_params_rep, device_rngs)
+            → (traj, last_values)
+          traj = (obs, actions, log_probs, values, rewards, dones)
+          each of shape (n_devices, n_steps, n_envs_per_device, ...)
     """
-    rng_key, reset_key = jax.random.split(rng_key)
-    rngs = jax.random.split(reset_key, n_envs)
-    state = env.reset(rngs)
+    actor_apply = agent.actor_module.apply
+    critic_apply = agent.critic_module.apply
+    n_envs_per_device = env.batch_size
 
-    obs_buf     = np.zeros((n_steps, n_envs, env.observation_size), np.float32)
-    action_buf  = np.zeros((n_steps, n_envs, env.action_size),      np.float32)
-    logprob_buf = np.zeros((n_steps, n_envs),                        np.float32)
-    reward_buf  = np.zeros((n_steps, n_envs),                        np.float32)
-    done_buf    = np.zeros((n_steps, n_envs),                        np.float32)
-    value_buf   = np.zeros((n_steps, n_envs),                        np.float32)
+    @partial(jax.pmap, axis_name='devices')
+    def _collect(actor_params, critic_params, device_rng):
+        # Each device resets its own independent environments
+        env_rngs = jax.random.split(device_rng, n_envs_per_device)
+        init_state = env.reset(env_rngs)
 
-    for t in range(n_steps):
-        obs = np.array(state.obs, dtype=np.float32)  # (n_envs, obs_dim)
-        rng_key, subkey = jax.random.split(rng_key)
-        actions, log_probs, values = agent.get_action_logprob_value(obs, rng_key=subkey)
+        def step_fn(carry, _):
+            state, rng = carry
+            rng, subkey = jax.random.split(rng)
+            obs = state.obs
 
-        obs_buf[t]     = obs
-        action_buf[t]  = actions
-        logprob_buf[t] = log_probs
-        value_buf[t]   = values
+            # Actor forward pass
+            mean, log_std = actor_apply({'params': actor_params}, obs)
+            std = jnp.exp(log_std)
+            action = jnp.clip(
+                mean + std * jax.random.normal(subkey, mean.shape), -1.0, 1.0
+            )
+            log_prob = (
+                -0.5 * (((action - mean) / std) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi))
+            ).sum(-1)
 
-        state = env.step(state, jnp.asarray(actions))
-        reward_buf[t] = np.array(state.reward)
-        done_buf[t]   = np.array(state.done)
+            # Critic forward pass
+            value = critic_apply({'params': critic_params}, obs)[..., 0]
 
-    # Bootstrap V(s_{T+1}) for the last state
-    last_value = agent.get_value(np.array(state.obs, dtype=np.float32))  # (n_envs,)
+            new_state = env.step(state, action)
+            return (new_state, rng), (
+                obs, action, log_prob, value, new_state.reward, new_state.done
+            )
 
-    # Compute GAE in reverse
-    advantages = np.zeros_like(value_buf)
-    last_gae = np.zeros(n_envs, np.float32)
-    for t in reversed(range(n_steps)):
-        nxt_val   = last_value if t == n_steps - 1 else value_buf[t + 1]
-        nxt_nterm = 1.0 - done_buf[t]
-        delta     = reward_buf[t] + gamma * nxt_val * nxt_nterm - value_buf[t]
-        last_gae  = delta + gamma * gae_lambda * nxt_nterm * last_gae
-        advantages[t] = last_gae
-    returns = advantages + value_buf
+        (final_state, _), traj = jax.lax.scan(
+            step_fn, (init_state, device_rng), None, length=n_steps
+        )
+        # Bootstrap value for the last observation
+        last_value = critic_apply({'params': critic_params}, final_state.obs)[..., 0]
+        return traj, last_value
 
-    def flat(x):
-        s = x.shape
-        return x.reshape(s[0] * s[1], *s[2:]) if len(s) > 2 else x.reshape(-1)
+    return _collect
 
-    return {
-        'obs':        flat(obs_buf),
-        'actions':    flat(action_buf),
-        'log_probs':  flat(logprob_buf),
-        'advantages': flat(advantages),
-        'returns':    flat(returns),
-    }, rng_key
+
+def make_gae_fn(gamma, gae_lambda):
+    """
+    Build a JIT-compiled GAE computation function.
+
+    Uses jax.lax.scan with reverse=True to replace the Python reverse loop,
+    keeping the entire computation on-device.
+    """
+    @jax.jit
+    def compute_gae(value_buf, reward_buf, done_buf, last_value):
+        """
+        Args:
+            value_buf:  (n_steps, n_envs) V(s_t) estimates
+            reward_buf: (n_steps, n_envs) rewards
+            done_buf:   (n_steps, n_envs) episode-end flags
+            last_value: (n_envs,) V(s_{T+1}) bootstrap
+        Returns:
+            advantages: (n_steps, n_envs)
+            returns:    (n_steps, n_envs)
+        """
+        # next_values[t] = value_buf[t+1] for t < T-1, last_value for t = T-1
+        next_values = jnp.concatenate([value_buf[1:], last_value[None]], axis=0)
+
+        def scan_fn(last_gae, x):
+            value, next_value, reward, done = x
+            nxt_nterm = 1.0 - done
+            delta = reward + gamma * next_value * nxt_nterm - value
+            last_gae = delta + gamma * gae_lambda * nxt_nterm * last_gae
+            return last_gae, last_gae
+
+        n_envs = value_buf.shape[1]
+        _, advantages = jax.lax.scan(
+            scan_fn,
+            jnp.zeros(n_envs),
+            (value_buf, next_values, reward_buf, done_buf),
+            reverse=True,
+        )
+        return advantages, advantages + value_buf
+
+    return compute_gae
 
 
 class Workspace:
@@ -143,17 +187,29 @@ class Workspace:
         self.model_dir = self.work_dir / 'models'
         self.model_dir.mkdir(exist_ok=True)
 
-        n_envs         = int(getattr(self.cfg, 'n_envs', 16))
+        self.n_devices = jax.device_count()
+        n_envs = int(getattr(self.cfg, 'n_envs', 16))
         episode_length = int(getattr(self.cfg, 'brax_episode_length', 1000))
-        self.n_envs    = n_envs
-        self.n_steps   = int(getattr(self.cfg, 'ppo_n_steps', 2048))
+        self.n_steps = int(getattr(self.cfg, 'ppo_n_steps', 2048))
         self.gae_lambda = float(getattr(self.cfg, 'ppo_gae_lambda', 0.95))
 
-        self.env = make_brax_env_batched(self.cfg.task_name, n_envs, episode_length)
+        # Ensure n_envs is divisible by n_devices
+        self.n_envs_per_device = max(1, n_envs // self.n_devices)
+        self.n_envs = self.n_envs_per_device * self.n_devices
 
-        obs_shape    = (self.env.observation_size,)
+        logging.getLogger(__name__).info(
+            f"Devices: {self.n_devices}, envs/device: {self.n_envs_per_device}, "
+            f"total envs: {self.n_envs}"
+        )
+
+        # Create env with per-device batch size; pmap handles device distribution
+        self.env = make_brax_env_batched(
+            self.cfg.task_name, self.n_envs_per_device, episode_length
+        )
+
+        obs_shape = (self.env.observation_size,)
         action_shape = (self.env.action_size,)
-        agent_cfg    = self.cfg.agent
+        agent_cfg = self.cfg.agent
 
         self.agent = PPOAgent(
             obs_shape=obs_shape,
@@ -169,21 +225,87 @@ class Workspace:
             max_grad_norm=float(getattr(agent_cfg, 'max_grad_norm', 0.5)),
         )
 
+        # Build JIT+pmap rollout function and JIT GAE function
+        self._rollout_fn = make_rollout_fn(self.env, self.agent, self.n_steps)
+        self._compute_gae = make_gae_fn(
+            gamma=float(self.cfg.discount),
+            gae_lambda=self.gae_lambda,
+        )
+
         utils.save_cfg(self.cfg, self.work_dir)
         utils.save_git_sha(self.work_dir)
 
+    def collect_rollouts(self):
+        """
+        Collect rollouts across all devices via pmap + lax.scan,
+        then compute GAE advantages with a JIT-compiled reverse scan.
+
+        Returns: flat rollout dict with keys obs, actions, log_probs,
+                 advantages, returns — each shaped (n_steps * n_envs, ...).
+        """
+        # Generate one PRNG key per device (devices get independent trajectories)
+        self.rng_key, *device_rngs = jax.random.split(self.rng_key, self.n_devices + 1)
+        device_rngs = jnp.stack(device_rngs)  # (n_devices, 2)
+
+        # Replicate params to all devices
+        actor_params_rep = jax.device_put_replicated(
+            self.agent.actor_state.params, jax.devices()
+        )
+        critic_params_rep = jax.device_put_replicated(
+            self.agent.critic_state.params, jax.devices()
+        )
+
+        # Run pmap'd lax.scan rollout
+        # traj: each tensor is (n_devices, n_steps, n_envs_per_device, ...)
+        # last_value: (n_devices, n_envs_per_device)
+        traj, last_value = self._rollout_fn(
+            actor_params_rep, critic_params_rep, device_rngs
+        )
+        jax.block_until_ready(traj)  # ensure timings are accurate
+
+        obs_buf, action_buf, logprob_buf, value_buf, reward_buf, done_buf = traj
+
+        # Merge device and env dims:
+        # (n_devices, n_steps, n_envs_per_device, ...) → (n_steps, n_envs, ...)
+        def merge(x):
+            # swap to (n_steps, n_devices, n_envs_per_device, ...) then flatten
+            x = x.swapaxes(0, 1)
+            return x.reshape(self.n_steps, self.n_envs, *x.shape[3:])
+
+        obs_buf     = merge(obs_buf)      # (n_steps, n_envs, obs_dim)
+        action_buf  = merge(action_buf)   # (n_steps, n_envs, action_dim)
+        logprob_buf = merge(logprob_buf)  # (n_steps, n_envs)
+        value_buf   = merge(value_buf)    # (n_steps, n_envs)
+        reward_buf  = merge(reward_buf)   # (n_steps, n_envs)
+        done_buf    = merge(done_buf)     # (n_steps, n_envs)
+        last_value  = last_value.reshape(self.n_envs)  # (n_envs,)
+
+        # JIT-compiled GAE with reverse lax.scan
+        advantages, returns = self._compute_gae(
+            value_buf, reward_buf, done_buf, last_value
+        )
+
+        def flat(x):
+            s = x.shape
+            return x.reshape(s[0] * s[1], *s[2:]) if len(s) > 2 else x.reshape(-1)
+
+        return {
+            'obs':        flat(obs_buf),
+            'actions':    flat(action_buf),
+            'log_probs':  flat(logprob_buf),
+            'advantages': flat(advantages),
+            'returns':    flat(returns),
+        }
+
     def train(self):
-        gamma      = float(self.cfg.discount)
+        gamma = float(self.cfg.discount)
         eval_every = utils.Every(int(self.cfg.eval_every_frames))
         save_every = utils.Every(int(self.cfg.save_every_frames))
         train_until = utils.Until(int(self.cfg.num_train_frames))
 
         while train_until(self._global_step):
-            rollout, self.rng_key = collect_rollouts(
-                self.env, self.agent, self.rng_key,
-                self.n_envs, self.n_steps, gamma, self.gae_lambda,
-            )
-            frames  = self.n_steps * self.n_envs
+            rollout = self.collect_rollouts()
+            frames = self.n_steps * self.n_envs
             metrics = self.agent.update(rollout, self._global_step)
             elapsed, total = self.timer.reset()
 
@@ -204,7 +326,6 @@ class Workspace:
             if eval_every(self._global_step):
                 self._eval()
 
-        # Always save at the end
         self.agent.save(self.model_dir, self._global_step)
 
     def _eval(self):
@@ -260,6 +381,8 @@ class Workspace:
         self.agent.critic_state = self.agent.critic_state.replace(
             params=jax.device_put(payload['critic_params'])
         )
+        # Force re-replication of params on next update
+        self.agent._invalidate_replicated_states()
 
 
 @hydra.main(version_base=None, config_path='cfgs', config_name='config')
@@ -271,6 +394,8 @@ def main(cfg):
         log.info(f"Running on GPU {device_id}.")
     except omegaconf.errors.MissingMandatoryValue:
         pass
+
+    log.info(f"JAX devices: {jax.devices()} ({jax.device_count()} total)")
 
     root_dir = Path.cwd()
     workspace = Workspace(cfg)
