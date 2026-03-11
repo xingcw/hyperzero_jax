@@ -88,16 +88,7 @@ class Workspace:
         self.n_envs = self.train_env.n_envs  # may differ if n_envs % n_devices != 0
         log.info(f"Effective n_envs: {self.n_envs} ({self.n_envs // n_devices} per device)")
 
-        # Single-env eval env (BraxWrapper interface)
-        from utils.brax import make as make_single
-        reward_parameters = OmegaConf.to_container(self.cfg.reward_parameters)
-        dynamics_parameters = OmegaConf.to_container(self.cfg.dynamics_parameters)
-        self.eval_env = make_single(
-            self.cfg.task_name, self.cfg.frame_stack,
-            self.cfg.action_repeat, reward_parameters,
-            dynamics_parameters, self.cfg.seed, self.cfg.pixel_obs,
-            episode_length=brax_episode_length,
-        )
+        # (eval fn built after agent, below)
 
         # In-memory circular replay buffer
         from utils.replay_buffer import CircularReplayBuffer
@@ -113,6 +104,16 @@ class Workspace:
             self.cfg.agent,
         )
 
+        # Scan-based batched eval: all episodes in parallel, lax.scan over steps
+        from utils.brax import make_scan_eval
+        self._jit_eval, self._eval_rng = make_scan_eval(
+            self.cfg.task_name,
+            int(self.cfg.num_eval_episodes),
+            brax_episode_length,
+            self.agent.actor_module.apply,
+            self.cfg.seed,
+        )
+
         utils.save_cfg(self.cfg, self.work_dir)
         utils.save_git_sha(self.work_dir)
 
@@ -125,23 +126,15 @@ class Workspace:
         return self._global_step * self.cfg.action_repeat
 
     def eval(self):
-        step, episode, total_reward = 0, 0, 0
-        eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
-        while eval_until_episode(episode):
-            time_step = self.eval_env.reset()
-            while not time_step.last():
-                with utils.eval_mode(self.agent):
-                    action = self.agent.act(
-                        time_step.observation, self.global_step, eval_mode=True
-                    )
-                time_step = self.eval_env.step(action)
-                total_reward += time_step.reward
-                step += 1
-            episode += 1
+        # All episodes run in parallel on-device; lax.scan replaces the step loop.
+        mean_reward, self._eval_rng = self._jit_eval(
+            self.agent.actor_state.params, self._eval_rng
+        )
+        self._global_episode += self.cfg.num_eval_episodes
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as lg:
-            lg('episode_reward', total_reward / episode)
-            lg('episode_length', step * self.cfg.action_repeat / episode)
+            lg('episode_reward', float(mean_reward))
+            lg('episode_length', self.cfg.brax_episode_length)
             lg('episode', self._global_episode)
             lg('step', self.global_step)
 
@@ -185,11 +178,14 @@ class Workspace:
             # ---- Update agent ----
             if (not seed_until(self.global_step) and
                     len(self.replay_buffer) >= batch_size):
-                # Do n_envs updates to maintain roughly 1:1 update-to-data ratio
-                for _ in range(n_envs):
-                    batch = self.replay_buffer.sample(batch_size)
-                    metrics = self.agent.update_batch(batch, self.global_step, discount)
-                    self.logger.log_metrics(metrics, self.global_frame, ty='train')
+                # One pmap call: lax.scan does all n_envs updates on-device
+                big_batch = self.replay_buffer.sample(batch_size * n_envs)
+                metrics = self.agent.update_many(
+                    big_batch, n_updates=n_envs,
+                    step=self.global_step, discount=discount,
+                )
+                metrics['batch_reward'] = float(np.mean(rewards))
+                self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
             self._global_step += n_envs
 

@@ -79,6 +79,8 @@ class TD3Agent:
 
         # Build pmap'd update functions
         self._pmap_critic_update, self._pmap_full_update = self._build_pmap_updates()
+        # Build scan-based multi-update (main training path)
+        self._pmap_scan_update = self._build_pmap_scan_update()
 
     # ------------------------------------------------------------------
     # Replicated state management
@@ -207,6 +209,97 @@ class TD3Agent:
 
         return pmap_critic_update, pmap_full_update
 
+    def _build_pmap_scan_update(self):
+        """
+        Single pmap call that scans over n_updates gradient steps on-device.
+
+        Inputs per device have shape (n_updates, mb_per_device, ...).
+        lax.scan loops over n_updates entirely in XLA — no Python overhead,
+        no extra host-device transfers.  donate_argnums reuses state buffers.
+        """
+        actor_apply = self.actor_module.apply
+        critic_apply = self.critic_module.apply
+        tau = self.critic_target_tau
+
+        @partial(jax.pmap, axis_name='devices', donate_argnums=(0, 1, 2, 3))
+        def pmap_scan_update(actor_state, critic_state,
+                             actor_target_params, critic_target_params,
+                             obs_seq, action_seq, reward_seq, disc_seq, next_obs_seq,
+                             stddev_seq, stddev_clip_seq, rng_seq):
+            # obs_seq: (n_updates, mb, obs_dim) — already per-device slice
+
+            def one_update(carry, x):
+                actor_state, critic_state, actor_target, critic_target = carry
+                obs, action, reward, disc, next_obs, stddev, stddev_clip, rng = x
+
+                # --- Critic update ---
+                next_action = actor_apply({'params': actor_target}, next_obs)
+                noise = jnp.clip(
+                    jax.random.normal(rng, action.shape) * stddev,
+                    -stddev_clip, stddev_clip,
+                )
+                next_action = jnp.clip(next_action + noise, -1.0, 1.0)
+                target_Q1, target_Q2 = critic_apply(
+                    {'params': critic_target}, next_obs, next_action
+                )
+                target_Q = reward + disc * jnp.minimum(target_Q1, target_Q2)
+
+                def critic_loss_fn(params):
+                    Q1, Q2 = critic_apply({'params': params}, obs, action)
+                    loss = (jnp.mean((Q1 - target_Q) ** 2) +
+                            jnp.mean((Q2 - target_Q) ** 2))
+                    return loss, (jnp.mean(Q1), jnp.mean(Q2), jnp.mean(target_Q))
+
+                (closs, (q1, q2, tq)), cgrads = jax.value_and_grad(
+                    critic_loss_fn, has_aux=True
+                )(critic_state.params)
+                cgrads = jax.lax.pmean(cgrads, axis_name='devices')
+                critic_state = critic_state.apply_gradients(grads=cgrads)
+
+                # --- Actor update ---
+                def actor_loss_fn(params):
+                    a = actor_apply({'params': params}, obs)
+                    q = critic_apply(
+                        {'params': critic_state.params}, obs, a, method=Critic.Q1
+                    )
+                    return -jnp.mean(q)
+
+                aloss, agrads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+                agrads = jax.lax.pmean(agrads, axis_name='devices')
+                actor_state = actor_state.apply_gradients(grads=agrads)
+
+                # --- Soft target update ---
+                new_actor_target = jax.tree_util.tree_map(
+                    lambda p, tp: tau * p + (1 - tau) * tp,
+                    actor_state.params, actor_target,
+                )
+                new_critic_target = jax.tree_util.tree_map(
+                    lambda p, tp: tau * p + (1 - tau) * tp,
+                    critic_state.params, critic_target,
+                )
+
+                closs = jax.lax.pmean(closs, axis_name='devices')
+                aloss = jax.lax.pmean(aloss, axis_name='devices')
+                metrics = jnp.stack([closs, q1, q2, tq, aloss])
+                return (actor_state, critic_state,
+                        new_actor_target, new_critic_target), metrics
+
+            (actor_state, critic_state,
+             actor_target_params, critic_target_params), all_metrics = jax.lax.scan(
+                one_update,
+                (actor_state, critic_state, actor_target_params, critic_target_params),
+                (obs_seq, action_seq, reward_seq, disc_seq, next_obs_seq,
+                 stddev_seq, stddev_clip_seq, rng_seq),
+            )
+            # Average metrics over all scan steps
+            mean_metrics = jax.lax.pmean(
+                jnp.mean(all_metrics, axis=0), axis_name='devices'
+            )
+            return (actor_state, critic_state,
+                    actor_target_params, critic_target_params, mean_metrics)
+
+        return pmap_scan_update
+
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
@@ -330,6 +423,67 @@ class TD3Agent:
         # Keep non-replicated state in sync for act() / save() / eval
         self._unreplicate()
         return metrics
+
+    def update_many(self, big_batch_dict, n_updates, step, discount=0.99):
+        """
+        Run n_updates gradient steps in a single pmap call via lax.scan.
+
+        big_batch_dict: CircularReplayBuffer.sample(n_updates * batch_size)
+        Compared to calling update_batch n_updates times:
+          - 1 host→device transfer instead of n_updates
+          - 1 pmap dispatch instead of n_updates
+          - XLA fuses + optimizes the full scan loop
+        """
+        n_devices = self.n_devices
+        total = len(big_batch_dict['obs'])
+        batch_size = total // n_updates
+        mb = batch_size // n_devices
+        # Trim to exact multiple
+        total = n_devices * n_updates * mb
+
+        obs      = jnp.asarray(big_batch_dict['obs'][:total],     dtype=jnp.float32)
+        action   = jnp.asarray(big_batch_dict['actions'][:total], dtype=jnp.float32)
+        reward   = jnp.asarray(big_batch_dict['rewards'][:total], dtype=jnp.float32).reshape(total, 1)
+        dones    = jnp.asarray(big_batch_dict['dones'][:total],   dtype=jnp.float32)
+        disc     = (1.0 - dones).reshape(total, 1) * discount
+        next_obs = jnp.asarray(big_batch_dict['next_obs'][:total],dtype=jnp.float32)
+
+        def shard_seq(x):
+            # (total, ...) → (n_devices, n_updates, mb, ...)
+            return x.reshape(n_devices, n_updates, mb, *x.shape[1:])
+
+        stddev = utils.schedule(self.stddev_schedule, step)
+        stddev_seq      = jnp.full((n_devices, n_updates), stddev)
+        stddev_clip_seq = jnp.full((n_devices, n_updates), self.stddev_clip)
+
+        self.rng_key, subkey = jax.random.split(self.rng_key)
+        rng_seq = jax.random.split(subkey, n_devices * n_updates).reshape(
+            n_devices, n_updates, 2
+        )
+
+        if self._critic_state_rep is None:
+            self._init_replicated_states()
+
+        (self._actor_state_rep,
+         self._critic_state_rep,
+         self._actor_target_rep,
+         self._critic_target_rep,
+         metrics_raw) = self._pmap_scan_update(
+            self._actor_state_rep, self._critic_state_rep,
+            self._actor_target_rep, self._critic_target_rep,
+            shard_seq(obs), shard_seq(action), shard_seq(reward), shard_seq(disc),
+            shard_seq(next_obs), stddev_seq, stddev_clip_seq, rng_seq,
+        )
+
+        self._unreplicate()
+        m = metrics_raw[0]  # same on all devices after pmean
+        return {
+            'critic_loss': float(m[0]),
+            'critic_q1':   float(m[1]),
+            'critic_q2':   float(m[2]),
+            'target_q':    float(m[3]),
+            'actor_loss':  float(m[4]),
+        }
 
     # ------------------------------------------------------------------
     # Legacy update interface (single-env disk-based replay — kept for compat)

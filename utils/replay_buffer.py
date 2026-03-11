@@ -190,10 +190,8 @@ class CircularReplayBuffer:
         self._size = min(self._size + n, self._capacity)
 
     def sample(self, batch_size):
-        """Sample a random batch. Returns a dict of numpy arrays."""
-        assert self._size >= batch_size, (
-            f"Buffer has only {self._size} transitions, need {batch_size}"
-        )
+        """Sample a random batch with replacement. Returns a dict of numpy arrays."""
+        assert self._size > 0, "Cannot sample from an empty buffer"
         idx = np.random.randint(0, self._size, batch_size)
         return {
             'obs':      self._obs[idx],

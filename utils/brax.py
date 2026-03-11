@@ -54,12 +54,16 @@ class BraxWrapper:
     """
 
     def __init__(self, env, seed):
+        import jax
         self._env = env
-        self._rng = __import__('jax').random.PRNGKey(seed)
+        self._rng = jax.random.PRNGKey(seed)
         self._state = None
         self._obs_spec = None
         self._action_spec = None
         self._init_specs()
+        # JIT-compile step and reset so eval doesn't retrace every call
+        self._jit_step = jax.jit(env.step)
+        self._jit_reset = jax.jit(env.reset)
 
     def _init_specs(self):
         import jax
@@ -90,7 +94,7 @@ class BraxWrapper:
     def reset(self):
         import jax
         self._rng, rng_use = jax.random.split(self._rng)
-        self._state = self._env.reset(rng_use)
+        self._state = self._jit_reset(rng_use)
         obs = self._obs_from_state(self._state)
         return TimeStep(
             observation=obs,
@@ -113,7 +117,7 @@ class BraxWrapper:
         else:
             action_batch = action
         action_jax = jax.numpy.array(action_batch)
-        self._state = self._env.step(self._state, action_jax)
+        self._state = self._jit_step(self._state, action_jax)
         obs = self._obs_from_state(self._state)
         reward = float(np.array(self._state.reward).ravel().item())
         done = bool(np.array(self._state.done).ravel().item())
@@ -267,3 +271,61 @@ def make(
         wrapper = ActionRepeatWrapper(wrapper, action_repeat)
     wrapper = ExtendedTimeStepWrapper(wrapper)
     return wrapper
+
+
+def make_scan_eval(name, num_episodes, episode_length, actor_apply_fn, seed):
+    """
+    Build a JIT'd eval function using lax.scan + batched episodes.
+
+    All num_episodes run in parallel on-device; lax.scan replaces the
+    Python step loop — zero Python overhead after the first (compile) call.
+
+    Returns: (jit_eval_fn, initial_rng)
+      jit_eval_fn(actor_params, rng) -> (mean_episode_reward, next_rng)
+    """
+    import jax
+    import jax.numpy as jnp
+    from brax import envs
+
+    name = name.lower().replace('-', '_')
+    if name == 'cheetah_run':
+        name = 'halfcheetah'
+    elif name == 'walker_walk':
+        name = 'walker2d'
+
+    env = envs.create(
+        env_name=name,
+        episode_length=episode_length,
+        action_repeat=1,
+        auto_reset=False,
+        batch_size=num_episodes,
+    )
+    jit_reset = jax.jit(env.reset)
+    jit_step  = jax.jit(env.step)
+
+    @jax.jit
+    def jit_eval(actor_params, rng):
+        rng, reset_rng = jax.random.split(rng)
+        state = jit_reset(reset_rng)
+
+        def step_fn(carry, _):
+            state, has_ended = carry
+            # Actor forward pass on batched obs (num_episodes, obs_dim)
+            actions = actor_apply_fn({'params': actor_params}, state.obs)
+            next_state = jit_step(state, actions)
+            # Mask rewards for steps after episode termination
+            reward = next_state.reward * (1.0 - has_ended)
+            has_ended = jnp.maximum(has_ended, next_state.done)
+            return (next_state, has_ended), reward
+
+        has_ended = jnp.zeros(num_episodes)
+        (_, _), rewards = jax.lax.scan(
+            step_fn,
+            (state, has_ended),
+            None,
+            length=episode_length,
+        )
+        # rewards: (episode_length, num_episodes) → sum per episode, then mean
+        return jnp.mean(jnp.sum(rewards, axis=0)), rng
+
+    return jit_eval, jax.random.PRNGKey(seed + 100)
