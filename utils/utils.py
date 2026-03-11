@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from omegaconf import OmegaConf
 
 
-_STATE_AGENTS = ['td3', 'random', 'lapleig']
+_STATE_AGENTS = ['td3', 'ppo', 'random', 'lapleig']
 _PIXEL_AGENTS = ['drqv2', 'random']
 
 

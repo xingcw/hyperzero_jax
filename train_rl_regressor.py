@@ -23,8 +23,8 @@ from pathlib import Path
 import hydra
 import omegaconf
 import jax
+import wandb
 from hydra.core.hydra_config import HydraConfig
-from torch.utils.tensorboard import SummaryWriter
 
 import utils.utils as utils
 from utils.dataset import RLSolutionDataset, RLSolutionMetaDataset
@@ -73,8 +73,18 @@ class Workspace:
         self._global_episode = 0
 
     def setup(self):
-        # create logger
-        self.logger = SummaryWriter(str(self.work_dir))
+        # Initialise W&B (graceful fallback to CSV-only if unavailable/unconfigured)
+        self._wandb_enabled = False
+        try:
+            if wandb.run is None:
+                wandb.init(
+                    project='hyperzero-jax',
+                    dir=str(self.work_dir),
+                    reinit=True,
+                )
+            self._wandb_enabled = True
+        except Exception:
+            pass
 
         self.model_dir = self.work_dir / 'models'
         self.model_dir.mkdir(exist_ok=True)
@@ -125,7 +135,6 @@ class Workspace:
         best_valid_td_loss = math.inf
 
         while train_until_epoch(self.global_epoch):
-            metrics.update()
 
             if self.is_meta_learning:
                 self.train_loader.shuffle_indices()
@@ -138,8 +147,8 @@ class Workspace:
             print(f"Epoch {self.global_epoch + 1} "
                   f"\t Train loss {metrics['train/loss_total']:.3f} "
                   f"\t Valid loss {metrics['valid/loss_total']:.3f}")
-            for k, v in metrics.items():
-                self.logger.add_scalar(k, v, self.global_epoch + 1)
+            if self._wandb_enabled:
+                wandb.log(metrics, step=self.global_epoch + 1)
             utils.dump_dict(f"{self.work_dir}/train_valid.csv", metrics)
 
             # Save the model

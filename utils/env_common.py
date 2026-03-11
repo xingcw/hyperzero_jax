@@ -88,8 +88,8 @@ class ExtendedTimeStepWrapper:
             observation=time_step.observation,
             step_type=time_step.step_type,
             action=action,
-            reward=time_step.reward or 0.0,
-            discount=time_step.discount or 1.0,
+            reward=float(time_step.reward) if time_step.reward is not None else 0.0,
+            discount=float(time_step.discount) if time_step.discount is not None else 1.0,
         )
 
     def observation_spec(self):

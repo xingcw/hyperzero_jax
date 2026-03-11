@@ -177,8 +177,9 @@ class Workspace:
                     episode_rollout['state'].append(time_step.observation)
                     episode_rollout['discount'].append(time_step.discount)
                     episode_rollout['action'].append(action)
-                    episode_rollout['physics_qpos'].append(env._physics.data.qpos.copy())
-                    episode_rollout['physics_qvel'].append(env._physics.data.qvel.copy())
+                    # Brax does not expose raw MuJoCo physics; store zero placeholders
+                    episode_rollout['physics_qpos'].append(np.zeros(1, dtype=np.float32))
+                    episode_rollout['physics_qvel'].append(np.zeros(1, dtype=np.float32))
 
                 time_step = env.step(action)
                 self.video_recorder.record(env)
@@ -224,37 +225,56 @@ class Workspace:
         path = f"{dir}/{name}.npy"
         np.save(path, rollout_data, allow_pickle=True)
 
+    # Keys that are metadata/settings, not context parameters to pass to the model
+    _NON_CONTEXT_KEYS = frozenset({'use_default', 'value_at_margin', 'bounds', 'sigmoid'})
+
+    @staticmethod
+    def _flatten_cfg_params(cfg_dict):
+        """Recursively flatten a config dict to a sorted list of finite scalar values."""
+        if not cfg_dict:
+            return []
+        values = []
+        for k in sorted(cfg_dict.keys()):
+            if k in Workspace._NON_CONTEXT_KEYS:
+                continue
+            v = cfg_dict[k]
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, str):
+                continue
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if np.isfinite(fv):
+                    values.append(fv)
+            elif isinstance(v, dict):
+                values.extend(Workspace._flatten_cfg_params(v))
+        return values
+
     def _get_reward_param(self):
-        reward_param = [self.cfg.reward_parameters.ALL.margin]
-        return reward_param
+        try:
+            params = self._flatten_cfg_params(OmegaConf.to_container(self.cfg.reward_parameters))
+        except (omegaconf.errors.ConfigAttributeError, Exception):
+            params = []
+        return params if params else [0.0]
 
     def _get_reward_param_dim(self):
-        reward_param_dim = 1
-        return reward_param_dim
+        return len(self._get_reward_param())
 
     def _get_dynamics_param(self):
         try:
-            dynamics_param = [self.cfg.dynamics_parameters.length]
-        except omegaconf.errors.ConfigAttributeError:
-            dynamics_param = [0]
-        return dynamics_param
+            params = self._flatten_cfg_params(OmegaConf.to_container(self.cfg.dynamics_parameters))
+        except (omegaconf.errors.ConfigAttributeError, Exception):
+            params = []
+        return params if params else [0.0]
 
     def _get_dynamics_param_dim(self):
-        # for now only a single param is changed for all experiments
-        dynamics_param_dim = 1
-        return dynamics_param_dim
+        return len(self._get_dynamics_param())
 
     def _get_reward_dynamics_param(self):
-        try:
-            dynamics_param = [self.cfg.reward_parameters.ALL.margin,
-                              self.cfg.dynamics_parameters.length]
-        except omegaconf.errors.ConfigAttributeError:
-            dynamics_param = [0, 0]
-        return dynamics_param
+        return self._get_reward_param() + self._get_dynamics_param()
 
     def _get_reward_dynamics_param_dim(self):
-        reward_dynamics_dim = 2
-        return reward_dynamics_dim
+        return len(self._get_reward_dynamics_param())
 
 
 def main():
@@ -322,7 +342,7 @@ def main():
                 rl_rollout_data['physics_qpos'],
                 rl_rollout_data['physics_qvel'],
                 z_data, workspace.plot_dir,
-                f"{workspace.base_name}_phase_{label}_{plot_type}_{args.random_rollout * 'random'}",
+                f"{workspace.base_name}_phase_{label}_{plot_type}",
                 goal_coord=None,
                 plot_type='scatter', label=label
             )

@@ -39,6 +39,10 @@ experiment: ''
 # agent
 lr: 1e-4
 feature_dim: 50
+# PPO-specific (used by train_ppo.py; ignored by train.py)
+n_envs: 16
+ppo_n_steps: 2048
+ppo_gae_lambda: 0.95
 
 hydra:
   job:

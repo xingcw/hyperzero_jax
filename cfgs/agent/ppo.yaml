@@ -1,0 +1,15 @@
+agent_name: ppo
+
+agent:
+  _target_: agents.ppo.PPOAgent
+  obs_shape: ???     # filled at runtime
+  action_shape: ???  # filled at runtime
+  device: ${device}
+  lr: ${lr}
+  hidden_dim: 256
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  n_epochs: 10
+  minibatch_size: 64
+  max_grad_norm: 0.5

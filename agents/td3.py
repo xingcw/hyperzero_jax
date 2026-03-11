@@ -72,7 +72,7 @@ class TD3Agent:
             pass  # deterministic
         else:
             stddev = utils.schedule(self.stddev_schedule, step)
-            action = action + np.random.normal(0, stddev, size=self.action_dim)
+            action = np.clip(action + np.random.normal(0, stddev, size=self.action_dim), -1.0, 1.0)
             if step < self.num_expl_steps:
                 action = np.random.uniform(-1.0, 1.0, size=self.action_dim)
         return action.astype(np.float32)
